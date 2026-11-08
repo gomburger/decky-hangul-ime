@@ -21,6 +21,13 @@ def load_backend(settings_dir):
     return module
 
 
+ACCOUNT = "100"
+
+
+def run(call):
+    return asyncio.run(call)
+
+
 class BackendTest(unittest.TestCase):
     def setUp(self):
         self.base = tempfile.mkdtemp()
@@ -29,6 +36,7 @@ class BackendTest(unittest.TestCase):
         self.backend = load_backend(os.path.join(self.base, "settings"))
         self.backend.runtime_dir = lambda: self.runtime
         self.backend.list_game_processes = lambda: []
+        self.backend.bridge.use_account(ACCOUNT)
 
     def test_daemon_reads_every_file_the_backend_writes(self):
         os.environ["XDG_RUNTIME_DIR"] = self.runtime
@@ -115,6 +123,7 @@ class BackendTest(unittest.TestCase):
         self.assertFalse(run(plugin.get_keyboard_mode(plugin))["english_on_close"])
         fresh = self.backend.Bridge()
         fresh.load()
+        fresh.use_account(ACCOUNT)
         self.assertFalse(fresh.games["3"]["english_on_close"])
         with self.assertRaises(ValueError):
             run(plugin.set_game_setting(plugin, "9", "english_on_close", True))
@@ -152,6 +161,7 @@ class BackendTest(unittest.TestCase):
         run(plugin.set_wake_wait_ms(plugin, "3", 600))
         fresh = self.backend.Bridge()
         fresh.load()
+        fresh.use_account(ACCOUNT)
         self.assertEqual(fresh.games["3"]["wake_wait_ms"], 600)
         self.assertTrue(fresh.games["3"]["ime_wake"])
         with self.assertRaises(ValueError):
@@ -164,6 +174,7 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(run(plugin.set_paste_gap_ms(plugin, 45))["paste_gap_ms"], 45)
         fresh = self.backend.Bridge()
         fresh.load()
+        fresh.use_account(ACCOUNT)
         self.assertEqual(fresh.paste_gap_ms, 45)
 
     def test_one_toggle_uses_both_keyboards(self):
@@ -187,6 +198,7 @@ class BackendTest(unittest.TestCase):
             run(plugin.set_toggle_key(plugin, name, False))
         fresh = self.backend.Bridge()
         fresh.load()
+        fresh.use_account(ACCOUNT)
         self.assertEqual(fresh.toggle_keys, [])
         with self.assertRaises(ValueError):
             run(plugin.set_toggle_key(plugin, "caps", True))
@@ -208,8 +220,57 @@ class BackendTest(unittest.TestCase):
             json.dump({"games": {"9": {"virtual": True, "physical": True, "direct": True, "erase_text": False}}}, settings)
         bridge = self.backend.Bridge()
         bridge.load()
+        bridge.use_account(ACCOUNT)
+        bridge.claim_games(["9"])
         self.assertEqual(bridge.games["9"]["paste"], False)
         self.assertEqual(bridge.paste_gap_ms, 35)
+
+    def test_each_account_has_its_own_games(self):
+        plugin, bridge = self.backend.Plugin, self.backend.bridge
+        run(plugin.set_game_enabled(plugin, "3", True))
+        run(plugin.set_game_input(plugin, "3", "paste", True))
+        self.assertEqual(run(plugin.set_account(plugin, "200")), [])
+        self.assertEqual(run(plugin.get_state(plugin))["games"], {})
+        run(plugin.set_game_enabled(plugin, "4", True))
+        fresh = self.backend.Bridge()
+        fresh.load()
+        self.assertEqual(fresh.games, {})  # no account yet, so no game is active
+        fresh.use_account(ACCOUNT)
+        self.assertEqual(list(fresh.games), ["3"])
+        self.assertTrue(fresh.games["3"]["paste"])
+        fresh.use_account("200")
+        self.assertEqual(list(fresh.games), ["4"])
+        self.assertEqual(bridge.account, "200")
+
+    def test_switching_account_leaves_the_game(self):
+        bridge = self.backend.bridge
+        bridge.game_window, bridge.active_game, bridge.in_game = 5, "3", True
+        bridge.use_account("200")
+        self.assertEqual((bridge.game_window, bridge.active_game, bridge.in_game), (None, None, False))
+
+    def test_older_games_go_only_to_the_account_that_claims_them(self):
+        import json
+        os.makedirs(os.path.dirname(self.backend.SETTINGS_FILE), exist_ok=True)
+        with open(self.backend.SETTINGS_FILE, "w", encoding="utf-8") as settings:
+            json.dump({"games": {"8": {"virtual": True, "direct": True}, "9": {"virtual": True}}}, settings)
+        plugin, bridge = self.backend.Plugin, self.backend.bridge
+        bridge.load()
+        bridge.account = None
+        self.assertEqual(run(plugin.set_account(plugin, "300")), ["8", "9"])
+        run(plugin.claim_games(plugin, ["8", "unknown"]))
+        self.assertEqual(list(bridge.games), ["8"])
+        self.assertTrue(bridge.games["8"]["direct"])
+        self.assertEqual(bridge.unclaimed_games(), ["9"])
+        self.assertEqual(run(plugin.set_account(plugin, "400")), ["8", "9"])  # still there for others
+        self.assertEqual(bridge.games, {})
+
+    def test_changes_wait_for_an_account(self):
+        plugin, bridge = self.backend.Plugin, self.backend.bridge
+        bridge.account = None
+        with self.assertRaises(ValueError):
+            run(plugin.set_game_enabled(plugin, "3", True))
+        with self.assertRaises(ValueError):
+            run(plugin.set_account(plugin, "not a number"))
 
 
 if __name__ == "__main__":

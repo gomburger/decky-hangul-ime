@@ -28,6 +28,8 @@ const setPasteGap = callable("set_paste_gap_ms");
 const setHangulMode = callable("set_hangul_mode");
 const getKeyboardMode = callable("get_keyboard_mode");
 const setKeyboardHangul = callable("set_keyboard_hangul");
+const setAccount = callable("set_account");
+const claimGames = callable("claim_games");
 
 const XIM_OPTION = "XMODIFIERS=@im=hangulbridge";
 const KEYBOARD_OPACITY_MIN = 30;
@@ -50,7 +52,12 @@ const STATUS_ON_COLOR = "#4caf50";
 const STATUS_OFF_COLOR = "#f44336";
 const ADVANCED_OPEN_KEY = "hangul-ime-advanced-open";
 const LOCALE_OPTION = "HOST_LC_ALL=ko_KR.UTF-8";
-const COPY_RESULT_MS = 2000;
+const XIM_OPTION_SET = /(^|\s)XMODIFIERS=@im=hangulbridge(?=\s|$)/;
+const ACCOUNT_RETRY_MS = 3000;
+const NOT_LOGGED_IN_STEAM_ID = "76561197960265728";  // Steam reports this until login ends
+const FIRST_SHORTCUT_APP_ID = 0x80000000;
+const LOCALE_OPTION_SET = /(^|\s)HOST_LC_ALL=ko_KR\.UTF-8(?=\s|$)/;
+const ANY_LOCALE_OPTION = /(^|\s)HOST_LC_ALL=\S*(?=\s|$)/g;
 // Leaves 16px between a section's dividing line and the next section's title.
 const SECTION_PULLED_UP = { marginTop: "-8.5px" };
 // The section right under the 고급 button, which has no dividing line above it.
@@ -106,6 +113,46 @@ async function applyLaunchOptions(app, enabled) {
     const isShortcut = app.app_type === SHORTCUT_APP_TYPE;
     const current = await readLaunchOptions(app.appid, isShortcut);
     const next = enabled ? addOption(current) : removeOption(current);
+    if (next === current) return;
+    if (isShortcut) SteamClient.Apps.SetShortcutLaunchOptions(app.appid, next);
+    else SteamClient.Apps.SetAppLaunchOptions(app.appid, next);
+}
+
+let accountReporting = false;
+let accountTimer = null;
+
+// Tell the backend whose games to use. Changing account restarts Steam and this
+// plugin with it, so this is needed only until it has worked once. The older shared list goes by launch options,
+// which each account keeps for itself: a game with the option is that account's.
+async function reportAccount() {
+    const account = window.App?.m_CurrentUser?.strSteamID;
+    if (!account || account === NOT_LOGGED_IN_STEAM_ID || accountReporting) return;
+    accountReporting = true;
+    try {
+        const unclaimed = await setAccount(account);
+        const options = await Promise.all(unclaimed.map(
+            (app) => readLaunchOptions(Number(app), Number(app) >= FIRST_SHORTCUT_APP_ID)));
+        const claimed = unclaimed.filter((_, index) => XIM_OPTION_SET.test(options[index]));
+        if (claimed.length) await claimGames(claimed);
+        clearInterval(accountTimer);
+    }
+    catch {
+        accountReporting = false;  // the timer tries again
+    }
+}
+
+function withLocaleOption(options, enabled) {
+    // A language set by hand is replaced, as two would clash.
+    const others = options.replace(ANY_LOCALE_OPTION, "").trim();
+    if (!enabled) return others === "%command%" ? "" : others;
+    if (others.includes("%command%")) return `${LOCALE_OPTION} ${others}`;
+    return others ? `${LOCALE_OPTION} %command% ${others}` : `${LOCALE_OPTION} %command%`;
+}
+
+async function applyLocaleOption(app, enabled) {
+    const isShortcut = app.app_type === SHORTCUT_APP_TYPE;
+    const current = await readLaunchOptions(app.appid, isShortcut);
+    const next = withLocaleOption(current, enabled);
     if (next === current) return;
     if (isShortcut) SteamClient.Apps.SetShortcutLaunchOptions(app.appid, next);
     else SteamClient.Apps.SetAppLaunchOptions(app.appid, next);
@@ -194,53 +241,43 @@ function StatusLight({ label, on }) {
         label);
 }
 
-// The panel runs in its own window, which is the one that has to do the copying. The
-// hidden field is read-only so that focusing it does not open the Steam keyboard.
-async function copyText(text, targetDocument) {
-    const field = targetDocument.createElement("textarea");
-    field.value = text;
-    field.readOnly = true;
-    field.style.position = "fixed";
-    field.style.opacity = "0";
-    const focused = targetDocument.activeElement;
-    targetDocument.body.appendChild(field);
-    field.focus();
-    field.select();
-    let copied = false;
-    try {
-        copied = targetDocument.execCommand("copy");
-    }
-    catch {
-        /* try the other way below */
-    }
-    field.remove();
-    focused?.focus?.();
-    if (!copied) await targetDocument.defaultView.navigator.clipboard.writeText(text);
-}
-
 function LocaleOptionSection() {
-    const [result, setResult] = SP_REACT.useState("");
-    const timer = SP_REACT.useRef(null);
-    SP_REACT.useEffect(() => () => clearTimeout(timer.current), []);
-    const onCopy = async (event) => {
-        const targetDocument = event?.currentTarget?.ownerDocument ?? document;
-        let text;
+    const app = DFL.Router.MainRunningApp;
+    const appId = app?.appid;
+    // Read from the game's launch options each time, so that it also shows an edit
+    // made by hand. null until read, or when there is no game to read.
+    const [enabled, setEnabled] = SP_REACT.useState(null);
+    const [changed, setChanged] = SP_REACT.useState(false);
+    SP_REACT.useEffect(() => {
+        let active = true;
+        setEnabled(null);
+        setChanged(false);
+        if (app) {
+            readLaunchOptions(app.appid, app.app_type === SHORTCUT_APP_TYPE)
+                .then((options) => { if (active) setEnabled(LOCALE_OPTION_SET.test(options)); })
+                .catch(() => {});
+        }
+        return () => { active = false; };
+    }, [appId]);
+    const onChange = async (next) => {
         try {
-            await copyText(LOCALE_OPTION, targetDocument);
-            text = "복사했어요";
+            await applyLocaleOption(app, next);
+            setEnabled(next);
+            setChanged(true);
         }
         catch {
-            text = "복사하지 못했어요";
+            /* the launch options stay as they were */
         }
-        setResult(text);
-        clearTimeout(timer.current);
-        timer.current = setTimeout(() => setResult(""), COPY_RESULT_MS);
     };
     return h(DFL.PanelSection, { title: "실행 옵션" },
-        h(DFL.PanelSectionRow, null,
-            h(DFL.ButtonItem, { layout: "below", bottomSeparator: "none", onClick: onCopy },
-                result || "한국어 실행 옵션 복사")),
-        ClosingNote(LOCALE_OPTION, "한글이 깨지거나 입력이 되지 않는 경우", "게임 속성의 실행 옵션에 붙여 넣어 주세요."));
+        h(ToggleRow, {
+            label: labelWithNote("한국어 환경으로 실행", LOCALE_OPTION, "글자가 깨지면 켜주세요.", "현재 게임에만 적용돼요."),
+            value: enabled === true,
+            disabled: enabled === null,
+            onChange,
+            separator: !changed,
+        }),
+        changed && ClosingNote("게임을 다시 켜야 적용돼요."));
 }
 
 function GameRow({ appId, running, onRemove }) {
@@ -1254,6 +1291,8 @@ var index = DFL.definePlugin(() => {
     patchKeyboards();
     const timer = setInterval(patchKeyboards, 3000);
     const keyboardTimer = setInterval(followKeyboardMode, KEYBOARD_MODE_POLL_MS);
+    accountTimer = setInterval(reportAccount, ACCOUNT_RETRY_MS);
+    reportAccount();
     return {
         name: manifest.name,
         titleView: h("div", { className: DFL.staticClasses.Title }, "한글 IME"),
@@ -1262,6 +1301,7 @@ var index = DFL.definePlugin(() => {
         onDismount() {
             clearInterval(timer);
             clearInterval(keyboardTimer);
+            clearInterval(accountTimer);
             restoreKeyboardLook();
             restoreKeyboards();
             removeKeyboardOpacity();

@@ -227,9 +227,25 @@ def stop_leftover_daemons():
                 pass
 
 
+def clean_game(game):
+    return {
+        **{key: bool(game.get(key)) for key in GAME_OPTIONS},
+        **{key: bool(game.get(key, default)) for key, default in GAME_SETTINGS.items()},
+        WAKE_WAIT_MS: clamp_wake_wait(game.get(WAKE_WAIT_MS, DEFAULT_WAKE_WAIT_MS)),
+    }
+
+
+def clean_games(games):
+    return {app: clean_game(game) for app, game in games.items()}
+
+
 class Bridge:
     def __init__(self):
-        self.games = {}  # app id -> {option in GAME_OPTIONS or GAME_SETTINGS: bool}
+        # Launch options belong to a Steam account, so the games do too.
+        self.accounts = {}  # Steam ID -> games
+        self.account = None
+        self.games = {}  # the current account's: app id -> {option: value}
+        self.legacy_games = {}  # saved before games were kept per account
         self.keep_keyboard_on_enter = True
         self.keyboard_opacity = DEFAULT_KEYBOARD_OPACITY
         self.backspace_hold_ms = DEFAULT_BACKSPACE_HOLD_MS
@@ -248,14 +264,10 @@ class Bridge:
                 saved = json.load(settings)
         except (OSError, ValueError):
             saved = {}
-        self.games = {
-            app: {
-                **{key: bool(game.get(key)) for key in GAME_OPTIONS},
-                **{key: bool(game.get(key, default)) for key, default in GAME_SETTINGS.items()},
-                WAKE_WAIT_MS: clamp_wake_wait(game.get(WAKE_WAIT_MS, DEFAULT_WAKE_WAIT_MS)),
-            }
-            for app, game in saved.get("games", {}).items()
+        self.accounts = {
+            account: clean_games(games) for account, games in saved.get("accounts", {}).items()
         }
+        self.legacy_games = clean_games(saved.get("legacy_games", saved.get("games", {})))
         self.keep_keyboard_on_enter = bool(saved.get("keep_keyboard_on_enter", True))
         self.keyboard_opacity = clamp_keyboard_opacity(
             saved.get("keyboard_opacity", DEFAULT_KEYBOARD_OPACITY)
@@ -275,7 +287,8 @@ class Bridge:
         with open(temporary, "w", encoding="utf-8") as settings:
             json.dump(
                 {
-                    "games": self.games,
+                    "accounts": self.accounts,
+                    "legacy_games": self.legacy_games,
                     "keep_keyboard_on_enter": self.keep_keyboard_on_enter,
                     "keyboard_opacity": self.keyboard_opacity,
                     "backspace_hold_ms": self.backspace_hold_ms,
@@ -286,6 +299,25 @@ class Bridge:
                 settings,
             )
         os.replace(temporary, SETTINGS_FILE)
+
+    def use_account(self, account):
+        """Switch to a Steam account's games. Until one is known no game is active."""
+        if account == self.account:
+            return
+        self.account = account
+        self.games = self.accounts.setdefault(account, {})
+        self.game_window = None
+        self.active_game = None
+        self.in_game = False
+
+    def unclaimed_games(self):
+        return sorted(app for app in self.legacy_games if app not in self.games)
+
+    def claim_games(self, apps):
+        """Give the current account its games from before they were kept per account."""
+        for app in apps:
+            if app in self.legacy_games and app not in self.games:
+                self.games[app] = dict(self.legacy_games[app])
 
     def sync(self):
         """Match the running processes to the current focus and settings."""
@@ -457,6 +489,11 @@ def current_state():
     }
 
 
+def require_account():
+    if bridge.account is None:
+        raise ValueError("Steam account is not known yet")
+
+
 class Plugin:
     # Decky calls these on the class itself, so `self` is not an instance and
     # the state lives at module level.
@@ -465,7 +502,7 @@ class Plugin:
         await asyncio.to_thread(stop_leftover_daemons)
         bridge.load()
         sync_task = asyncio.create_task(sync_loop())
-        log.info("loaded, registered games: %s", sorted(bridge.games))
+        log.info("loaded")
 
     async def _unload(self):
         if sync_task:
@@ -475,9 +512,25 @@ class Plugin:
     async def get_state(self):
         return await asyncio.to_thread(current_state)
 
+    async def set_account(self, steam_id):
+        """Follow the logged-in Steam account, and answer with the games from before
+        they were kept per account that this account has not taken yet."""
+        account = str(steam_id)
+        if not account.isdigit():
+            raise ValueError("unknown Steam account")
+        bridge.use_account(account)
+        bridge.save()
+        return bridge.unclaimed_games()
+
+    async def claim_games(self, app_ids):
+        bridge.claim_games([str(app) for app in app_ids])
+        bridge.save()
+        return await asyncio.to_thread(current_state)
+
     async def set_game_enabled(self, app_id, enabled):
         """Use the bridge in a game, for both the Steam keyboard and the physical
         one, or stop, which forgets the game's other options too."""
+        require_account()
         app = str(app_id)
         if enabled:
             game = bridge.games.get(app, new_game())
@@ -493,6 +546,7 @@ class Plugin:
         no longer registered, and its other options go with it."""
         if input_type not in GAME_OPTIONS:
             raise ValueError(f"unknown option {input_type}")
+        require_account()
         app = str(app_id)
         game = bridge.games.get(app, new_game())
         game[input_type] = bool(enabled)
