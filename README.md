@@ -10,7 +10,7 @@ Steam Deck 게임 모드에서 Proton(Wine) 게임에 한글을 입력하게 해
 
 ## 설치
 
-1. `decky-hangul-ime.zip`을 Steam Deck에 내려받습니다.
+1. [릴리스 페이지](https://github.com/gomburger/decky-hangul-ime/releases/latest)에서 `decky-hangul-ime-1.0.0.zip`을 Steam Deck에 내려받습니다.
 2. Decky 설정에서 개발자 모드를 켭니다.
 3. Decky 설정의 **개발자** 메뉴에서 **ZIP으로 플러그인 설치**를 선택하고 내려받은 파일을 고릅니다.
 

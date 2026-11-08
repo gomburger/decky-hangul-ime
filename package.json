@@ -1,7 +1,16 @@
 {
   "name": "decky-hangul-ime",
   "version": "1.0.0",
-  "description": "Korean input from the Steam virtual keyboard and physical keyboards for Proton games, delivered through Wine's IME",
+  "description": "Korean input from the Steam virtual keyboard and physical keyboards for Proton games, delivered through Wine's IME or by pasting",
   "type": "module",
-  "license": "MIT"
+  "license": "MIT",
+  "author": "gomburger",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gomburger/decky-hangul-ime.git"
+  },
+  "homepage": "https://github.com/gomburger/decky-hangul-ime#readme",
+  "bugs": {
+    "url": "https://github.com/gomburger/decky-hangul-ime/issues"
+  }
 }

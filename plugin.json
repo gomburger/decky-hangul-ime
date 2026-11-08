@@ -5,7 +5,7 @@
   "api_version": 1,
   "publish": {
     "tags": ["keyboard", "korean"],
-    "description": "Steam 가상 키보드와 물리 키보드의 한글 입력을 Windows IME 방식으로 게임에 전달합니다.",
+    "description": "Steam 가상 키보드와 물리 키보드의 한글 입력을 IME 또는 붙여넣기 방식으로 게임에 전달합니다.",
     "image": ""
   }
 }
