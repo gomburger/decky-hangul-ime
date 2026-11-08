@@ -1,0 +1,7 @@
+{
+  "name": "decky-hangul-ime",
+  "version": "1.0.0",
+  "description": "Korean input from the Steam virtual keyboard and physical keyboards for Proton games, delivered through Wine's IME",
+  "type": "module",
+  "license": "MIT"
+}

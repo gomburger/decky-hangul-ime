@@ -1,0 +1,34 @@
+"""The small files the plugin and each display's daemon talk through.
+
+Both sides build the names here, so they cannot drift apart.
+"""
+
+import os
+
+# Written by the plugin: whether the focused game uses each option. These are also
+# the option names in the settings and the UI.
+VIRTUAL = "virtual"  # the Steam keyboard
+PHYSICAL = "physical"  # the physical keyboard
+DIRECT = "direct"  # typing the composition as text
+ERASE_TEXT = "erase_text"  # erasing it with Backspace characters rather than keys
+PASTE = "paste"  # pasting finished text with Ctrl+V, for games the IME cannot reach
+IME_WAKE = "ime_wake"  # pressing a key after Enter, so the game turns its IME back on
+GAME_OPTIONS = (VIRTUAL, PHYSICAL, DIRECT, ERASE_TEXT, PASTE, IME_WAKE)
+# Written by the plugin: how long direct mode holds Backspace, in milliseconds.
+BACKSPACE_HOLD_MS = "backspace_hold_ms"
+# Written by the plugin: each wait of a paste, in milliseconds.
+PASTE_GAP_MS = "paste_gap_ms"
+# Written by the plugin: after Enter, how long before the key that wakes the focused
+# game's IME, in milliseconds. Also the name of that setting for each game.
+WAKE_WAIT_MS = "wake_wait_ms"
+# Written by the plugin: the keys that switch between Hangul and English, by name,
+# comma separated.
+TOGGLE_KEYS = "toggle_keys"
+# Written by the daemon: whether physical keys are typing Hangul.
+MODE = "mode"
+# Written by the plugin: the mode its button asks for, removed by the daemon once read.
+MODE_REQUEST = "mode-request"
+
+
+def state_path(runtime_dir, display, name):
+    return os.path.join(runtime_dir, f"hangul-bridge-{display.lstrip(':')}.{name}")
