@@ -26,6 +26,8 @@ from paste_output import DEFAULT_GAP_SECONDS, PasteOutput, Paster
 from state_files import state_path
 from steam_focus import SteamFocus
 from steam_typing import BACKSPACE_KEYSYM, SteamTyping, hangul_text
+from text_batch import BatchDisplay, TextBatch
+from text_overlay import TextOverlay
 from typing_session import BACKSPACE_CODE, OTHER_MODIFIERS, PHYSICAL_JAMO, TypingSession
 from xim_server import TOGGLE_KEYS, XimServer
 
@@ -33,6 +35,7 @@ SERVER_NAME = "hangulbridge"
 EVDEV_TO_X11_KEYCODE = 8
 KEY_PRESS = 2
 CONTROL_MASK = 0x04
+MOD1_MASK = 0x08
 # Shift, Control, Alt, Caps Lock and Super, which never become text.
 MODIFIER_CODES = frozenset((29, 42, 54, 56, 58, 97, 100, 125, 126))
 STATE_CHECK_SECONDS = 0.25
@@ -50,6 +53,12 @@ WAKE_GIVE_UP_SECONDS = 0.4
 # Enter, which sends a line and closes the text field; opened again, some games
 # leave their IME off until a key.
 ENTER_CODES = frozenset((28, 96))  # Enter, keypad Enter
+ESCAPE_CODE = 1
+# While a toggle key is held, X sends every key to this, so a paste would miss the
+# game. Once it is up, a moment for a Shift held with it too.
+TOGGLE_SETTLE_SECONDS = 0.08
+TOGGLE_RELEASE_GIVE_UP_SECONDS = 1.0
+FIRST_PRINTABLE_KEYSYM, LAST_PRINTABLE_KEYSYM = 0x20, 0x7E
 # The wake key goes this long after Enter at least: before, the field opened by
 # Enter does not take the key yet.
 ENTER_SETTLE_SECONDS = 0.5
@@ -317,16 +326,31 @@ class Daemon:
             self.paster = None  # pasting is not possible here; the IME is used instead
         else:
             self.paste_output = PasteOutput(self.server, self.timers, self.paster, lambda: self.forwarding)
+            self.paste_output.on_idle = self._update_forwarding
         try:
             self.keymap = KeymapWatch(display, lambda keysym: hangul_text(keysym) is not None)
         except OSError:
             self.keymap = None  # keys are read as the map is when they come in
         self.session = TypingSession(self.output, self.timers)
+        self.overlay = None
+        self.batch = None  # the text held until sent
+        self.batch_display = None
+        self.paste_batch = False
+        self.batch_row_missing = False
+        self.was_steam_typing = False
+        if self.paste_output and STEAM_DISPLAY:
+            try:
+                self.overlay = TextOverlay(STEAM_DISPLAY, self.timers)
+            except OSError:
+                pass  # physical keys' text is then pasted as it is typed
         self.steam = SteamTyping(self.session, self.timers)
         self.server.on_reset = self.session.on_reset
         self.server.on_focus = self._on_focus
         self.server.on_key = self._on_key
         self.server.on_toggle = self._toggle_mode
+        self.server.on_toggle_released = self._toggle_released
+        self.server.on_grabbed_key = self._grabbed_key
+        self.toggle_timer = None
 
         def path(name):
             return state_path(RUNTIME_DIR, display, name)
@@ -339,6 +363,11 @@ class Daemon:
         self.erase_text_file = path(state_files.ERASE_TEXT)
         self.backspace_hold_file = path(state_files.BACKSPACE_HOLD_MS)
         self.paste_file = path(state_files.PASTE)
+        self.paste_batch_file = path(state_files.PASTE_BATCH)
+        self.batch_row_missing_file = path(state_files.BATCH_ROW_MISSING)
+        if self.paste_output:
+            self.batch_display = BatchDisplay(path(state_files.BATCH_TEXT), lambda: self.steam_typing, self.overlay)
+            self.batch = TextBatch(self.paste_output, self.batch_display)
         self.toggle_keys_file = path(state_files.TOGGLE_KEYS)
         self.toggle_keys = tuple(TOGGLE_KEYS)
         self.paste_gap_file = path(state_files.PASTE_GAP_MS)
@@ -374,7 +403,9 @@ class Daemon:
     def _update_forwarding(self):
         """Have Wine pass keys here only while something here needs them, since each
         key then makes a round trip."""
-        forward = self.hangul_mode or self.steam_typing
+        # Also until a paste is over, so that keys typed after it stay behind it.
+        pasting = self.paste_output is not None and not self.paste_output.idle
+        forward = self.hangul_mode or self.steam_typing or pasting
         if forward != self.forwarding:
             self.forwarding = forward
             self.server.set_forward_keys(forward)
@@ -385,12 +416,49 @@ class Daemon:
         self.hangul_mode = enabled
         if not enabled:
             self.session.finish()
+            self._send_batch()
         self._update_forwarding()
         with open(self.mode_file, "w", encoding="utf-8") as mode:
             mode.write("1" if enabled else "0")
 
     def _toggle_mode(self):
+        if self.hangul_mode and self.output is self.paste_output and self._has_text_to_send():
+            self.paste_output.pause()
+            self._wait_for_toggle(TOGGLE_RELEASE_GIVE_UP_SECONDS)
         self._set_hangul_mode(not self.hangul_mode)
+
+    def _has_text_to_send(self):
+        return bool(self.session.composing or self.session.pending or (self.batching and not self.batch.empty))
+
+    def _wait_for_toggle(self, seconds):
+        if self.toggle_timer:
+            self.toggle_timer.cancel()
+        self.toggle_timer = self.timers.call_later(seconds, self._toggle_is_up)
+
+    def _toggle_released(self):
+        if self.toggle_timer:
+            self._wait_for_toggle(TOGGLE_SETTLE_SECONDS)
+
+    def _grabbed_key(self, keycode, state, pressed):
+        """A key typed while a toggle key is still down, which X sends here instead
+        of to the game. It goes the way any key does, in the new mode. An Alt in its
+        state is the toggle key's."""
+        state &= ~MOD1_MASK
+        if not self.last_key:
+            # Nothing to hand a key to the game with: only a jamo can be kept.
+            if pressed:
+                self._take_key(keycode, keycode - EVDEV_TO_X11_KEYCODE, state)
+            return
+        context, serial, event = self.last_key
+        event = bytearray(event)
+        event[0] = KEY_PRESS if pressed else KEY_PRESS + 1
+        event[1] = keycode
+        event[28:30] = (state & 0xFFFF).to_bytes(2, "little")
+        self._on_key(context, serial, bytes(event))
+
+    def _toggle_is_up(self):
+        self.toggle_timer = None
+        self.paste_output.resume()
 
     def _check_state(self):
         """Follow which keyboards the focused game uses. The toggle keys are held
@@ -409,12 +477,17 @@ class Daemon:
                 self.server.grab_toggle_keys(self.toggle_keys)
             else:
                 self.server.ungrab_toggle_keys()
+                # The game has lost focus, and the text would go nowhere.
+                self._drop_batch()
                 self._set_hangul_mode(False)
         virtual = read_flag(self.virtual_file)
         if virtual != self.virtual_active:
             self.virtual_active = virtual
             self._steam_typing_changed()
         self._set_paste(read_flag(self.paste_file))
+        self.paste_batch = read_flag(self.paste_batch_file)
+        self.batch_row_missing = read_flag(self.batch_row_missing_file)
+        self._update_batch()
         self._set_direct(read_flag(self.direct_file))
         self.game_output.erase_text = read_flag(self.erase_text_file)
         self.game_output.backspace_hold = read_milliseconds(self.backspace_hold_file, BACKSPACE_HOLD_SECONDS)
@@ -426,6 +499,7 @@ class Daemon:
     def _steam_typing_changed(self):
         if not self.steam_typing:
             self.steam.finish()
+        self._update_batch()
         self._update_forwarding()
 
     def _set_direct(self, direct):
@@ -447,9 +521,72 @@ class Daemon:
             return
         self.steam.finish()
         self.session.finish()
+        self._send_batch()
         self.output = self.paste_output if paste else self.game_output
         self.session.output = self.output
         self.session.direct = paste or self.game_output.direct
+
+    @property
+    def batching(self):
+        return self.batch is not None and self.session.output is self.batch
+
+    def _send_batch(self):
+        if self.batch:
+            self.batch.flush()
+
+    def _drop_batch(self):
+        if self.batching:
+            self.session.drop_composing()
+            self.batch.clear()
+
+    def _update_batch(self):
+        """Hold typed text, where that is wanted and there is a place to show it.
+        Where there is none, text is pasted as it is typed. Closing the Steam
+        keyboard sends what is held, as the typing is over."""
+        steam_typing = self.steam_typing
+        keyboard_closed = self.was_steam_typing and not steam_typing
+        moved = self.was_steam_typing != steam_typing
+        self.was_steam_typing = steam_typing
+        shown = not self.batch_row_missing if steam_typing else self.overlay is not None
+        use = self.batch is not None and self.paste_batch and self.output is self.paste_output and shown
+        if use == self.batching:
+            if self.batching and keyboard_closed:
+                self.session.finish()
+                self.batch.flush()
+            elif self.batching and moved:
+                self.batch.refresh()
+            return
+        self.session.finish()
+        if use:
+            self.session.output = self.batch
+        else:
+            self.batch.flush()
+            self.session.output = self.output
+
+    def _batch_key(self, keycode, code, state, keysym):
+        """Handle a key that edits the held text, returning whether it did. Before
+        the first jamo nothing is held, and such keys go to the game as usual."""
+        if self.batch.empty and self.session.composer.empty:
+            return False
+        if state & OTHER_MODIFIERS:
+            return False
+        if code == ESCAPE_CODE:
+            self._drop_batch()
+            return True
+        if code == BACKSPACE_CODE:
+            if not self.session.composer.empty:
+                return False  # the session takes it off the syllable
+            self.batch.erase()
+            return True
+        if code in PHYSICAL_JAMO and self.hangul_mode:
+            return False
+        if keysym is None:
+            keysym = self.server.lookup_keysym(keycode, state)
+        if keysym and FIRST_PRINTABLE_KEYSYM <= keysym <= LAST_PRINTABLE_KEYSYM:
+            self.session.finish()
+            self.batch.commit(chr(keysym))
+            return True
+        return False
 
     def _on_focus(self, focused):
         self.game_output.on_focus(focused)
@@ -497,6 +634,7 @@ class Daemon:
         """Handle a key press here, returning False if it should go to the game."""
         if code in MODIFIER_CODES:
             return False
+        keysym = None
         if self.steam_typing:
             keysym = self.server.lookup_keysym(keycode, state)
             if self.keymap:
@@ -508,7 +646,13 @@ class Daemon:
             if keysym == BACKSPACE_KEYSYM and self.steam.on_backspace():
                 return True
             self.steam.finish()
-        return self.hangul_mode and self.session.physical_key(code, state)
+        if self.batching and self._batch_key(keycode, code, state, keysym):
+            return True
+        if self.hangul_mode and self.session.physical_key(code, state):
+            return True
+        if self.batching:
+            self.batch.flush()  # before the key, which then follows the paste
+        return False
 
     def _wake_game(self):
         """Press the wake key, for a game that may have its IME off: some games turn
@@ -661,6 +805,10 @@ class Daemon:
             self.focus.close()
         if self.paster:
             self.paster.close()
+        if self.batch_display:
+            self.batch_display.show("")
+        if self.overlay:
+            self.overlay.close()
         if self.keymap:
             self.keymap.close()
         for path in (self.mode_file, self.mode_request_file):

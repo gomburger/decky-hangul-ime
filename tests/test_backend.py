@@ -67,13 +67,14 @@ class BackendTest(unittest.TestCase):
             bridge.set_input_state(":1", option, True)
         bridge.set_input_state(":1", self.backend.BACKSPACE_HOLD_MS, 65)
         bridge.set_input_state(":1", self.backend.PASTE_GAP_MS, 40)
+        bridge.set_input_state(":1", self.backend.BATCH_ROW_MISSING, False)
         bridge.set_input_state(":1", self.backend.TOGGLE_KEYS, "hangul")
         bridge.set_input_state(":1", self.backend.WAKE_WAIT_MS, 550)
         written = {os.path.join(self.runtime, name) for name in os.listdir(self.runtime)}
         read = {
             daemon.physical_file, daemon.virtual_file, daemon.direct_file, daemon.erase_text_file,
             daemon.backspace_hold_file, daemon.paste_file, daemon.paste_gap_file, daemon.toggle_keys_file,
-            daemon.wake_wait_file, daemon.ime_wake_file,
+            daemon.wake_wait_file, daemon.ime_wake_file, daemon.paste_batch_file, daemon.batch_row_missing_file,
         }
         self.assertEqual(read, written)
         self.assertEqual(self.backend.input_state_path(":1", self.backend.MODE), daemon.mode_file)
@@ -103,7 +104,7 @@ class BackendTest(unittest.TestCase):
         run(plugin.set_game_enabled(plugin, "7", True))
         bridge.in_game, bridge.active_game = True, "7"
         self.assertEqual(run(plugin.get_keyboard_mode(plugin)),
-                         {"active": True, "hangul": False, "english_on_close": True})
+                         {"active": True, "hangul": False, "english_on_close": True, "batch": False})
         run(plugin.set_send_method(plugin, "7", "direct"))
         self.assertTrue(run(plugin.get_keyboard_mode(plugin))["active"])  # in every mode
         bridge.in_game = False
@@ -212,6 +213,16 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(xim_daemon.read_toggle_keys(written), ("shift_space",))
         bridge.set_input_state(":1", self.backend.TOGGLE_KEYS, "")
         self.assertEqual(xim_daemon.read_toggle_keys(written), ())
+
+    def test_batching_is_on_by_default_and_stays_as_set(self):
+        plugin, run = self.backend.Plugin, asyncio.run
+        self.assertTrue(run(plugin.set_game_enabled(plugin, "3", True))["games"]["3"]["paste_batch"])
+        run(plugin.set_game_input(plugin, "3", "paste_batch", False))
+        fresh = self.backend.Bridge()
+        fresh.load()
+        fresh.use_account(ACCOUNT)
+        self.assertFalse(fresh.games["3"]["paste_batch"])
+        self.assertTrue(self.backend.clean_game({"virtual": True})["paste_batch"])
 
     def test_older_settings_load_without_paste(self):
         import json

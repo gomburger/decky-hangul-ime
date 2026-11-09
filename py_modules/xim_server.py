@@ -68,6 +68,7 @@ XIM_PREEDIT_DONE = 78
 
 FORWARD_SYNCHRONOUS = 0x0001
 KEY_EVENT_MASKS = 0x0003  # KeyPressMask | KeyReleaseMask
+KEY_EVENT_STATE_OFFSET = 80  # in an XKeyEvent, on 64-bit, followed by the keycode
 COMMIT_LOOKUP_CHARS = 0x0002
 PREEDIT_STATUS_NO_FEEDBACK = 0x0002
 
@@ -177,6 +178,8 @@ class XimServer:
         self.on_reset = lambda: None
         self.on_key = lambda _context, _serial, _event: None
         self.on_toggle = lambda: None
+        self.on_toggle_released = lambda: None
+        self.on_grabbed_key = lambda keycode, state, pressed: None
         self._contexts = set()
         self._forward_keys = False
         self._grabbed = []
@@ -294,12 +297,23 @@ class XimServer:
                 self._on_client_message(event.raw)
             elif kind == SELECTION_REQUEST:
                 self._on_selection_request(event.raw)
-            elif kind == KEY_PRESS and self._grabbed:
-                now = time.monotonic()
-                if now - self._last_toggle > TOGGLE_DEBOUNCE_SECONDS:
-                    self._last_toggle = now
-                    self.on_toggle()
+            elif kind in (KEY_PRESS, KEY_PRESS + 1) and self._grabbed:
+                self._on_grabbed_event(event.raw, kind == KEY_PRESS)
         self._x.XFlush(self._display)
+
+    def _on_grabbed_event(self, raw, pressed):
+        """Handle a key that came here by the toggle key's grab. While a toggle key
+        is held, every other key comes this way too, and belongs to the player."""
+        state, keycode = struct.unpack_from("<II", raw, KEY_EVENT_STATE_OFFSET)
+        if keycode not in self._grabbed:
+            self.on_grabbed_key(keycode, state, pressed)
+        elif not pressed:
+            self.on_toggle_released()
+        else:
+            now = time.monotonic()
+            if now - self._last_toggle > TOGGLE_DEBOUNCE_SECONDS:
+                self._last_toggle = now
+                self.on_toggle()
 
     def _on_selection_request(self, raw):
         requestor, selection, target, prop, when = struct.unpack_from("<QQQQQ", raw, 40)

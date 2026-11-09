@@ -13,7 +13,8 @@ DIRECT = "direct"  # typing the composition as text
 ERASE_TEXT = "erase_text"  # erasing it with Backspace characters rather than keys
 PASTE = "paste"  # pasting finished text with Ctrl+V, for games the IME cannot reach
 IME_WAKE = "ime_wake"  # pressing a key after Enter, so the game turns its IME back on
-GAME_OPTIONS = (VIRTUAL, PHYSICAL, DIRECT, ERASE_TEXT, PASTE, IME_WAKE)
+PASTE_BATCH = "paste_batch"  # holding pasted text on an input line until Enter
+GAME_OPTIONS = (VIRTUAL, PHYSICAL, DIRECT, ERASE_TEXT, PASTE, IME_WAKE, PASTE_BATCH)
 # Written by the plugin: how long direct mode holds Backspace, in milliseconds.
 BACKSPACE_HOLD_MS = "backspace_hold_ms"
 # Written by the plugin: each wait of a paste, in milliseconds.
@@ -24,6 +25,11 @@ WAKE_WAIT_MS = "wake_wait_ms"
 # Written by the plugin: the keys that switch between Hangul and English, by name,
 # comma separated.
 TOGGLE_KEYS = "toggle_keys"
+# Written by the plugin: whether the Steam keyboard's input row could not be found.
+BATCH_ROW_MISSING = "batch_row_missing"
+# Written by the daemon, readable only by this user: the text held for sending, for
+# the Steam keyboard's input row. Only there while there is such text.
+BATCH_TEXT = "batch-text"
 # Written by the daemon: whether physical keys are typing Hangul.
 MODE = "mode"
 # Written by the plugin: the mode its button asks for, removed by the daemon once read.

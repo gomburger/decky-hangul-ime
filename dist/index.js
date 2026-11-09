@@ -30,6 +30,8 @@ const getKeyboardMode = callable("get_keyboard_mode");
 const setKeyboardHangul = callable("set_keyboard_hangul");
 const setAccount = callable("set_account");
 const claimGames = callable("claim_games");
+const getBatchText = callable("get_batch_text");
+const setBatchRowMissing = callable("set_batch_row_missing");
 
 const XIM_OPTION = "XMODIFIERS=@im=hangulbridge";
 const KEYBOARD_OPACITY_MIN = 30;
@@ -55,6 +57,7 @@ const LOCALE_OPTION = "HOST_LC_ALL=ko_KR.UTF-8";
 const XIM_OPTION_SET = /(^|\s)XMODIFIERS=@im=hangulbridge(?=\s|$)/;
 const ACCOUNT_RETRY_MS = 3000;
 const NOT_LOGGED_IN_STEAM_ID = "76561197960265728";  // Steam reports this until login ends
+const isLoggedInSteamId = (id) => /^\d+$/.test(id ?? "") && BigInt(id) > BigInt(NOT_LOGGED_IN_STEAM_ID);
 const FIRST_SHORTCUT_APP_ID = 0x80000000;
 const LOCALE_OPTION_SET = /(^|\s)HOST_LC_ALL=ko_KR\.UTF-8(?=\s|$)/;
 const ANY_LOCALE_OPTION = /(^|\s)HOST_LC_ALL=\S*(?=\s|$)/g;
@@ -126,7 +129,7 @@ let accountTimer = null;
 // which each account keeps for itself: a game with the option is that account's.
 async function reportAccount() {
     const account = window.App?.m_CurrentUser?.strSteamID;
-    if (!account || account === NOT_LOGGED_IN_STEAM_ID || accountReporting) return;
+    if (!isLoggedInSteamId(account) || accountReporting) return;
     accountReporting = true;
     try {
         const unclaimed = await setAccount(account);
@@ -359,7 +362,7 @@ function ToggleRow({ label, value, disabled, onChange, separator }) {
 // How the focused game gets the composition. Typing it as text and pasting are
 // toggles that exclude each other; with both off, the IME is used. The settings of
 // each show only while it is on.
-function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, onEraseTextChange, onPasteGapChange, onImeWakeChange, onWakeWaitChange }) {
+function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, onEraseTextChange, onPasteGapChange, onPasteBatchChange, onImeWakeChange, onWakeWaitChange }) {
     const method = sendMethod(game);
     const direct = method === "direct";
     const paste = method === "paste";
@@ -385,6 +388,13 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
         }),
     ] : [];
     const pasteSettings = paste ? [
+        h(ToggleRow, {
+            label: labelWithNote("모아서 입력", "입력한 한글을 입력줄에 모아", "Enter로 한 번에 보내요."),
+            value: Boolean(game?.paste_batch),
+            disabled: !isEnabled,
+            onChange: onPasteBatchChange,
+            separator: true,
+        }),
         ...MillisecondsStepper({
             title: "붙여넣기 간격",
             value: state?.paste_gap_ms,
@@ -721,6 +731,7 @@ function App() {
                     onHoldChange: onBackspaceHoldChange,
                     onEraseTextChange: onOptionToggle("erase_text"),
                     onPasteGapChange,
+                    onPasteBatchChange: onOptionToggle("paste_batch"),
                     onImeWakeChange: onOptionToggle("ime_wake"),
                     onWakeWaitChange,
                 } })),
@@ -871,6 +882,7 @@ function patchKeyboards() {
 // Only what shows and which letter goes out change: if this stops working after a
 // Steam update, the keyboard goes on typing as Steam's own.
 const KEYBOARD_MODE_POLL_MS = 500;
+const BATCH_TEXT_POLL_MS = 60;
 const GLOBE_KEY = "SwitchKeys_Layout";
 const KOREAN_LAYOUT = "korean";
 const LAYOUT_SWITCH_TRIES = 6;
@@ -988,12 +1000,26 @@ function typeLetter(keyboard, letter, key) {
     }));
 }
 
+// From the globe key until the daemon has left Hangul mode, it would compose what is
+// typed, so keys wait, whatever the keyboard already shows.
+function goingToEnglish(keyboard) {
+    if (!keyboardMode.active || !typingIntoGame(keyboard)) return false;
+    return keyboardState(keyboard).toEnglish === true || (hangulTarget === false && keyboardMode.hangul);
+}
+
+function releaseHeldKeys() {
+    const held = heldKeys;
+    heldKeys = [];
+    for (const { keyboard, own, key } of held) own.TypeKeyInternal.call(keyboard, key);
+}
+
 function patchKeyboardClass(keyboard) {
     const prototype = Object.getPrototypeOf(keyboard);
     if (patchedKeyboardClasses.has(prototype)) return;
     const own = {
         TypeKeyInternal: prototype.TypeKeyInternal,
         BIsKeyEnabled: prototype.BIsKeyEnabled,
+        LongPressTimerExpired: prototype.LongPressTimerExpired,
         setState: prototype.setState,
         hadSetState: Object.prototype.hasOwnProperty.call(prototype, "setState"),
     };
@@ -1001,6 +1027,10 @@ function patchKeyboardClass(keyboard) {
     prototype.TypeKeyInternal = function (key) {
         if (keyboardMode.active && key?.strKey === GLOBE_KEY && typingIntoGame(this)) {
             pressGlobe(this, own);
+            return undefined;
+        }
+        if (goingToEnglish(this)) {
+            heldKeys.push({ keyboard: this, own, key });
             return undefined;
         }
         if (hangulShowing(this)) {
@@ -1020,6 +1050,19 @@ function patchKeyboardClass(keyboard) {
             return own.BIsKeyEnabled.call(this, key);
         };
     }
+    if (typeof own.LongPressTimerExpired === "function") {
+        // Touch and mouse start this timer on every key, whatever the key's attribute
+        // says. Left alone here, the key is typed when it is let go. Backspace
+        // repeats through this timer, and keeps doing so.
+        prototype.LongPressTimerExpired = function (source) {
+            const slot = hangulShowing(this) ? this.LongPressSlot?.(source) : null;
+            if (slot?.holdTarget && slot.holdTarget.getAttribute("data-key") !== "Backspace") {
+                slot.nTimer = null;
+                return undefined;
+            }
+            return own.LongPressTimerExpired.call(this, source);
+        };
+    }
     // Caps Lock comes on by touch, held, and by a stick click too: while Hangul
     // shows, every change keeps it off.
     prototype.setState = function (update, callback) {
@@ -1035,6 +1078,7 @@ function unpatchKeyboardClasses() {
     for (const [prototype, own] of patchedKeyboardClasses) {
         prototype.TypeKeyInternal = own.TypeKeyInternal;
         if (own.BIsKeyEnabled) prototype.BIsKeyEnabled = own.BIsKeyEnabled;
+        if (own.LongPressTimerExpired) prototype.LongPressTimerExpired = own.LongPressTimerExpired;
         if (own.hadSetState) prototype.setState = own.setState;
         else delete prototype.setState;
     }
@@ -1047,20 +1091,26 @@ function switchLayout(keyboard, toKorean) {
     const own = patchedKeyboardClasses.get(Object.getPrototypeOf(keyboard));
     if (state.switching || !own) return;
     state.switching = true;
+    state.toEnglish = !toKorean;
     let tries = 0;
     const step = () => {
         if (showsKorean(keyboard) === toKorean) {
             state.switching = false;
+            state.toEnglish = false;
             state.layout = layoutName(keyboard);
             switchHangulMode(toKorean);
             return;
         }
         if (!keyboard.m_keyboardDiv?.isConnected || !keyboardShown(keyboard) || !typingIntoGame(keyboard)) {
             state.switching = false;  // closed meanwhile: done again as it opens
+            state.toEnglish = false;
+            releaseHeldKeys();
             return;
         }
         if (tries >= LAYOUT_SWITCH_TRIES) {
             state.switching = false;
+            state.toEnglish = false;
+            releaseHeldKeys();
             if (toKorean) {
                 // No Korean layout to go to: the letters are composed all the same.
                 state.noKorean = true;
@@ -1098,7 +1148,8 @@ function findKeyboards() {
     }
 }
 
-// The look of Hangul: no extended characters, so a long press types the key at once.
+// The look of Hangul: no extended characters, so a controller's press types the key
+// at once. Touch and mouse are handled in LongPressTimerExpired.
 function showHangul(keyboard) {
     const root = keyboard.m_keyboardDiv;
     if (!root) return;
@@ -1238,10 +1289,14 @@ let modeSwitches = 0;
 // Letters typed on the Korean layout while switching to Hangul: sent once it is on,
 // so they are composed rather than typed as English.
 let heldLetters = [];
+let heldKeys = [];
 
 async function switchHangulMode(on) {
     const target = on ?? !(hangulTarget ?? keyboardMode.hangul);
-    if (target === (hangulTarget ?? keyboardMode.hangul)) return;
+    if (target === (hangulTarget ?? keyboardMode.hangul)) {
+        releaseHeldKeys();
+        return;
+    }
     hangulTarget = target;
     modeSwitches += 1;
     let next = null;
@@ -1261,6 +1316,72 @@ async function switchHangulMode(on) {
     const letters = heldLetters;
     heldLetters = [];
     for (const { keyboard, letter, shift } of letters) sendLetter(keyboard, letter, shift);
+    releaseHeldKeys();
+}
+
+function isInputRowState(value) {
+    return value && typeof value === "object" && "strText" in value && "nCursorPos" in value
+        && "bVisible" in value && !("vecCandidates" in value);
+}
+
+// The row the Japanese keyboard shows what it composes in. It draws a state of its
+// own, which is where the text goes.
+function findInputRowHook(keyboard) {
+    const stack = [keyboard._reactInternals?.child];
+    while (stack.length) {
+        const fiber = stack.pop();
+        if (!fiber) continue;
+        stack.push(fiber.sibling, fiber.child);
+        let hook = fiber.memoizedState;
+        if (!hook || typeof hook !== "object" || !("queue" in hook)) continue;
+        for (; hook; hook = hook.next) {
+            if (isInputRowState(hook.memoizedState) && hook.queue?.dispatch) return hook;
+        }
+    }
+    return null;
+}
+
+function keyboardTypingIntoGame() {
+    for (const keyboard of keyboards) {
+        if (keyboardShown(keyboard) && typingIntoGame(keyboard)) return keyboard;
+    }
+    return null;
+}
+
+let batchRowMissing = false;
+let batchTextAsked = false;
+
+// Against what the row has now, as changing layout empties it.
+function setInputRow(hook, text) {
+    const shown = hook?.memoizedState;
+    if (!shown || (shown.strText === text && shown.bVisible === (text !== ""))) return;
+    hook.queue.dispatch({ strText: text, nCursorPos: text.length, bVisible: text !== "" });
+}
+
+// Steam keeps the row's text to a third of the width, cut off at the start so that
+// the end shows. The cut stays, at the full width.
+function widenInputRow(keyboard) {
+    const text = keyboard.m_keyboardDiv?.querySelector(".Row_IME")?.firstElementChild;
+    if (text && text.style.maxWidth !== "100%") text.style.maxWidth = "100%";
+}
+
+function reportInputRow(found) {
+    if (found === !batchRowMissing) return;
+    batchRowMissing = !found;
+    setBatchRowMissing(batchRowMissing).catch(() => {});
+}
+
+function followBatchText() {
+    const keyboard = keyboardMode.active && keyboardMode.batch ? keyboardTypingIntoGame() : null;
+    if (!keyboard || batchTextAsked) return;
+    const hook = findInputRowHook(keyboard);
+    reportInputRow(Boolean(hook));
+    widenInputRow(keyboard);
+    batchTextAsked = true;
+    getBatchText()
+        .then((text) => setInputRow(hook, text))
+        .catch(() => {})
+        .finally(() => { batchTextAsked = false; });
 }
 
 function followKeyboardMode() {
@@ -1291,6 +1412,7 @@ var index = DFL.definePlugin(() => {
     patchKeyboards();
     const timer = setInterval(patchKeyboards, 3000);
     const keyboardTimer = setInterval(followKeyboardMode, KEYBOARD_MODE_POLL_MS);
+    const batchTextTimer = setInterval(followBatchText, BATCH_TEXT_POLL_MS);
     accountTimer = setInterval(reportAccount, ACCOUNT_RETRY_MS);
     reportAccount();
     return {
@@ -1301,6 +1423,7 @@ var index = DFL.definePlugin(() => {
         onDismount() {
             clearInterval(timer);
             clearInterval(keyboardTimer);
+            clearInterval(batchTextTimer);
             clearInterval(accountTimer);
             restoreKeyboardLook();
             restoreKeyboards();

@@ -4,6 +4,7 @@ the paster are fakes, and time is a fake clock."""
 
 import os
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,7 +46,7 @@ class Clock:
 
 
 class FakePaster:
-    control, v, wake = CONTROL, V, WAKE
+    control, v, wake, real_v = CONTROL, V, WAKE, PLAYER_V
 
     def __init__(self, clock, log, game=None):
         self.clock, self.log, self.game = clock, log, game
@@ -55,6 +56,11 @@ class FakePaster:
     def keys_ready(self):
         return self.ready
 
+    real_v_up = True
+
+    def real_v_ready(self, must_be_up):
+        return self.ready and (self.real_v_up or not must_be_up)
+
     def wake_ready(self):
         return self.ready
 
@@ -63,6 +69,8 @@ class FakePaster:
 
     def key(self, keycode, pressed):
         self.log.append((round(self.clock.now, 3), "press" if pressed else "release", keycode))
+        if keycode == self.real_v:
+            self.real_v_up = not pressed
         if self.game:
             self.game(keycode, pressed)
 
@@ -106,6 +114,90 @@ class PasteOutputTest(unittest.TestCase):
         self.assertEqual(self.log[-1], ("back", "next"))
         self.assertEqual(round(self.clock.now, 3), 0.175)
 
+    def presses(self):
+        return [entry[2] for entry in self.log if entry[1] == "press"]
+
+    def test_held_text_is_pasted_with_the_real_v(self):
+        self.make()
+        self.output.commit("가나", real_v=True)
+        self.clock.run()
+        self.assertEqual(self.presses(), [CONTROL, PLAYER_V])
+
+    def test_the_paste_does_not_wait_for_its_own_v(self):
+        self.make()
+        self.output.commit("가", real_v=True)
+        self.clock.run()
+        self.assertEqual([entry for entry in self.log if entry[1] != "back"], [
+            (0.0, "clipboard", "가"),
+            (0.035, "press", CONTROL),
+            (0.07, "press", PLAYER_V),
+            (0.105, "release", PLAYER_V),
+            (0.14, "release", CONTROL),
+        ])
+
+    def test_keys_behind_a_paste_are_a_gap_apart(self):
+        self.make()
+        self.output.commit("가")
+        self.output.send_key(None, 0, "press")
+        self.output.send_key(None, 0, "release")
+        self.clock.run()
+        back = [entry[1] for entry in self.log if entry[0] == "back"]
+        self.assertEqual(back, ["press", "release"])
+        # Press at 0.175, release a gap later, and a gap after each before the next.
+        self.assertEqual(round(self.clock.now, 3), round(0.175 + 2 * GAP, 3))
+
+    def test_a_release_right_after_the_paste_still_waits_a_gap(self):
+        self.make()
+        self.output.commit("가")
+        self.output.send_key(None, 0, "press")
+        for _ in range(100):
+            if ("back", "press") in self.log:
+                break
+            self.step()
+        self.output.send_key(None, 0, "release")
+        self.assertNotIn(("back", "release"), self.log)
+        self.clock.run()
+        self.assertIn(("back", "release"), self.log)
+
+    def test_keys_with_no_paste_go_at_once(self):
+        self.make()
+        self.output.send_key(None, 0, "press")
+        self.output.send_key(None, 0, "release")
+        self.assertEqual(self.log, [("back", "press"), ("back", "release")])
+
+    def test_text_a_killed_server_left_behind_is_removed(self):
+        path = os.path.join(tempfile.mkdtemp(), "batch-text")
+        with open(path, "w", encoding="utf-8") as held:
+            held.write("left behind")
+        xim_daemon.BatchDisplay(path, lambda: False, None)
+        self.assertFalse(os.path.exists(path))
+
+    def test_the_spare_key_stays_for_text_as_typed(self):
+        self.make()
+        self.output.commit("가", real_v=True)
+        self.clock.run()
+        self.output.commit("나")
+        self.clock.run()
+        self.assertEqual(self.presses(), [CONTROL, PLAYER_V, CONTROL, V])
+
+    def test_the_real_v_waits_while_the_player_holds_it(self):
+        self.make()
+        self.paster.real_v_up = False
+        self.output.commit("가", real_v=True)
+        for _ in range(4):
+            self.step()
+        self.assertEqual(self.presses(), [])
+        self.paster.real_v_up = True
+        self.clock.run()
+        self.assertEqual(self.presses(), [CONTROL, PLAYER_V])
+
+    def test_text_for_each_key_is_not_merged(self):
+        self.make()
+        self.output.busy = True
+        self.output.commit("가")
+        self.output.commit("나", real_v=True)
+        self.assertEqual(len(self.output.queue), 2)
+
     def test_key_after_text_waits_for_the_paste(self):
         self.make()
         self.output.commit("안녕")
@@ -138,7 +230,7 @@ class PasteOutputTest(unittest.TestCase):
         self.output.send_key(None, 0, "after")
         self.clock.run()
         self.assertEqual(self.log[-1], ("back", "after"))
-        self.assertEqual(round(self.clock.now, 3), 0.175)
+        self.assertEqual(round(self.clock.now, 3), round(0.175 + GAP, 3))  # a gap after the key
 
     def test_waits_while_the_key_map_is_not_ready(self):
         self.make()
@@ -264,6 +356,237 @@ class DaemonPasteTest(unittest.TestCase):
         for code in codes:
             self.press(code, True, evdev=True, state=state)
             self.press(code, False, evdev=True, state=state)
+
+    def start_batching(self):
+        shown = self.shown = []
+        overlay = type("Overlay", (), {"show": lambda _self, text: shown.append(text)})()
+        self.daemon.overlay = self.daemon.batch_display.overlay = overlay
+        self.row_file = os.path.join(tempfile.mkdtemp(), "batch-text")
+        self.daemon.batch_display.path = self.row_file
+        self.daemon.paste_batch = True
+        self.daemon._set_paste(True)
+        self.daemon._update_batch()
+        self.daemon.server.lookup_keysym = lambda _keycode, _state: self.keysym
+
+    keysym = 0
+
+    def pastes(self):
+        return [entry[2] for entry in self.log if entry[1] == "clipboard"]
+
+    def test_batch_holds_the_text_until_enter(self):
+        self.start_batching()
+        self.type_jamo([30, 37, 44, 18])  # ㅁㅏ, then ㅋㄷ: not one syllable
+        self.clock.run()
+        self.assertEqual(self.pastes(), [])
+        self.assertTrue(self.shown[-1])
+        held = self.daemon.batch.text + self.daemon.batch.composing
+        self.press(28, True, evdev=True)
+        self.press(28, False, evdev=True)
+        self.clock.run()
+        self.assertEqual(self.pastes(), [held])
+        self.assertIn(PLAYER_V, [e[2] for e in self.log if e[1] == "press"])
+        self.assertNotIn(V, [e[2] for e in self.log if e[1] == "press"])
+        self.assertEqual(self.shown[-1], "")
+        self.assertEqual([e[1] for e in self.log if e[0] == "back" and e[1] == 28 + xim_daemon.EVDEV_TO_X11_KEYCODE],
+                         [28 + xim_daemon.EVDEV_TO_X11_KEYCODE] * 2)
+
+    def test_before_the_first_jamo_keys_go_to_the_game(self):
+        self.start_batching()
+        self.keysym = 0x20
+        self.press(57, True, evdev=True)
+        self.clock.run()
+        self.assertIn(("back", 57 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+        self.assertEqual(self.daemon.batch.text, "")
+
+    def test_batch_keeps_spaces_and_erases_held_text(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.keysym = 0x20
+        self.press(57, True, evdev=True)
+        self.assertEqual(self.daemon.batch.text, "마 ")
+        self.press(14, True, evdev=True)
+        self.assertEqual(self.daemon.batch.text, "마")
+        self.press(14, True, evdev=True)
+        self.assertEqual(self.shown[-1], "")
+        self.clock.run()
+        self.assertEqual(self.pastes(), [])
+        self.assertNotIn(("back", 14 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+
+    def test_escape_drops_the_held_text(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.press(1, True, evdev=True)
+        self.press(1, False, evdev=True)
+        self.clock.run()
+        self.assertEqual(self.pastes(), [])
+        self.assertEqual(self.shown[-1], "")
+        self.assertNotIn(("back", 1 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+
+    def test_batch_is_sent_when_leaving_hangul_mode(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._set_hangul_mode(False)
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+
+    def test_toggle_key_sends_the_batch_only_once_it_is_up(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._toggle_mode()
+        self.assertFalse(self.daemon.hangul_mode)
+        self.assertEqual(self.shown[-1], "")
+        self.assertEqual(self.pastes(), [])
+        self.clock.now += 0.5  # the key is still held
+        self.assertEqual(self.pastes(), [])
+        self.daemon._toggle_released()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+
+    def test_a_toggle_key_never_seen_up_does_not_keep_the_text(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._toggle_mode()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+
+    def test_toggling_without_text_holds_nothing_back(self):
+        self.start_batching()
+        self.daemon._toggle_mode()
+        self.assertFalse(self.daemon.paste_output.paused)
+
+    def test_the_key_after_the_toggle_follows_the_paste(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._toggle_mode()
+        self.press(57, True, evdev=True)
+        self.assertNotIn(("back", 57 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+        self.daemon._toggle_released()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertIn(("back", 57 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+
+    def grabbed(self, code, pressed=True, state=0):
+        self.daemon._grabbed_key(code + xim_daemon.EVDEV_TO_X11_KEYCODE, state, pressed)
+
+    def test_jamo_typed_while_the_toggle_key_is_down_are_kept(self):
+        self.start_batching()
+        self.press(57, True, evdev=True)  # any key, which gives the daemon a window
+        self.press(57, False, evdev=True)
+        self.daemon.hangul_mode = False
+        self.daemon._toggle_mode()
+        self.assertTrue(self.daemon.hangul_mode)
+        self.grabbed(30)
+        self.grabbed(30, False)
+        self.grabbed(37)
+        self.assertEqual(self.shown[-1], "마")
+        self.assertNotIn(("back", 30 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+
+    def test_alt_of_the_toggle_key_does_not_end_a_jamo(self):
+        self.start_batching()
+        self.grabbed(30, state=xim_daemon.MOD1_MASK)
+        self.grabbed(37, state=xim_daemon.MOD1_MASK)
+        self.assertEqual(self.shown[-1], "마")
+
+    def test_keys_stay_forwarded_until_the_paste_is_over(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._toggle_mode()
+        self.assertTrue(self.daemon.forwarding)
+        self.daemon._toggle_released()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertFalse(self.daemon.forwarding)
+
+    def test_english_typed_right_after_the_toggle_follows_the_paste(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon._toggle_mode()
+        self.grabbed(30)  # still down: X sends it here
+        self.grabbed(30, False)
+        self.press(31, True, evdev=True)  # let go by now: Wine forwards it
+        self.press(31, False, evdev=True)
+        self.daemon._toggle_released()
+        self.clock.run()
+        clipboard = next(i for i, e in enumerate(self.log) if e[1] == "clipboard")
+        keycodes = [e[1] for e in self.log[clipboard:] if e[0] == "back"]
+        for code in (30, 31):
+            self.assertIn(code + xim_daemon.EVDEV_TO_X11_KEYCODE, keycodes)
+
+    def test_other_keys_send_the_batch_first(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.press(103, True, evdev=True)  # an arrow key, with no text of its own
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertIn(("back", 103 + xim_daemon.EVDEV_TO_X11_KEYCODE), self.log)
+
+    def row_text(self):
+        try:
+            with open(self.row_file, encoding="utf-8") as held:
+                return held.read()
+        except OSError:
+            return ""
+
+    def open_steam_keyboard(self):
+        self.daemon.virtual_active = True
+        self.daemon._steam_typing_changed()
+
+    def test_the_steam_keyboard_shows_held_text_in_its_row(self):
+        self.start_batching()
+        self.open_steam_keyboard()
+        self.type_jamo([30, 37])
+        self.clock.run()
+        self.assertEqual(self.pastes(), [])
+        self.assertEqual(self.row_text(), "마")
+        self.assertEqual(oct(os.stat(self.row_file).st_mode & 0o777), "0o600")
+        self.assertEqual(self.shown[-1], "")  # not on the overlay as well
+
+    def test_closing_the_steam_keyboard_sends_what_is_held(self):
+        self.start_batching()
+        self.open_steam_keyboard()
+        self.type_jamo([30, 37])
+        self.daemon.virtual_active = False
+        self.daemon._steam_typing_changed()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertEqual(self.row_text(), "")
+
+    def test_opening_the_steam_keyboard_moves_what_is_held(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.assertEqual(self.shown[-1], "마")
+        self.open_steam_keyboard()
+        self.clock.run()
+        self.assertEqual(self.pastes(), [])
+        self.assertEqual(self.row_text(), "마")
+        self.assertEqual(self.shown[-1], "")
+
+    def test_enter_on_the_steam_keyboard_sends_and_clears_the_row(self):
+        self.start_batching()
+        self.open_steam_keyboard()
+        self.type_jamo([30, 37])
+        self.press(28, True, evdev=True)
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertEqual(self.row_text(), "")
+
+    def test_without_the_input_row_the_steam_keyboard_pastes_at_once(self):
+        self.start_batching()
+        self.daemon.batch_row_missing = True
+        self.open_steam_keyboard()
+        self.assertFalse(self.daemon.batching)
+        self.type_jamo([30, 37, 44, 37])  # the last vowel ends 마
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+
+    def test_turning_batching_off_sends_what_is_held(self):
+        self.start_batching()
+        self.type_jamo([30, 37])
+        self.daemon.paste_batch = False
+        self.daemon._update_batch()
+        self.clock.run()
+        self.assertEqual(self.pastes(), ["마"])
+        self.assertFalse(self.daemon.batching)
 
     def test_switching_to_paste_and_back(self):
         daemon = self.daemon

@@ -21,7 +21,7 @@ if os.path.join(PLUGIN_DIR, "py_modules") not in sys.path:
     sys.path.insert(0, os.path.join(PLUGIN_DIR, "py_modules"))
 
 from state_files import (  # noqa: E402
-    BACKSPACE_HOLD_MS, DIRECT, GAME_OPTIONS, MODE, MODE_REQUEST, PASTE, PASTE_GAP_MS, PHYSICAL, TOGGLE_KEYS,
+    BACKSPACE_HOLD_MS, BATCH_ROW_MISSING, BATCH_TEXT, DIRECT, GAME_OPTIONS, MODE, MODE_REQUEST, PASTE, PASTE_BATCH, PASTE_GAP_MS, PHYSICAL, TOGGLE_KEYS,
     WAKE_WAIT_MS,
     VIRTUAL, state_path,
 )
@@ -98,7 +98,10 @@ def clamp_wake_wait(value):
 
 
 def new_game():
-    return {key: False for key in GAME_OPTIONS} | GAME_SETTINGS | {WAKE_WAIT_MS: DEFAULT_WAKE_WAIT_MS}
+    return (
+        {key: False for key in GAME_OPTIONS} | {PASTE_BATCH: True} | GAME_SETTINGS
+        | {WAKE_WAIT_MS: DEFAULT_WAKE_WAIT_MS}
+    )
 
 
 def clamp_paste_gap(value):
@@ -230,6 +233,7 @@ def stop_leftover_daemons():
 def clean_game(game):
     return {
         **{key: bool(game.get(key)) for key in GAME_OPTIONS},
+        PASTE_BATCH: bool(game.get(PASTE_BATCH, True)),
         **{key: bool(game.get(key, default)) for key, default in GAME_SETTINGS.items()},
         WAKE_WAIT_MS: clamp_wake_wait(game.get(WAKE_WAIT_MS, DEFAULT_WAKE_WAIT_MS)),
     }
@@ -246,6 +250,7 @@ class Bridge:
         self.account = None
         self.games = {}  # the current account's: app id -> {option: value}
         self.legacy_games = {}  # saved before games were kept per account
+        self.batch_row_missing = False  # the Steam keyboard's input row was not found
         self.keep_keyboard_on_enter = True
         self.keyboard_opacity = DEFAULT_KEYBOARD_OPACITY
         self.backspace_hold_ms = DEFAULT_BACKSPACE_HOLD_MS
@@ -354,6 +359,7 @@ class Bridge:
         for display in game_displays:
             for input_type in GAME_OPTIONS:
                 self.set_input_state(display, input_type, bool(game.get(input_type)))
+            self.set_input_state(display, BATCH_ROW_MISSING, self.batch_row_missing)
             self.set_input_state(display, BACKSPACE_HOLD_MS, self.backspace_hold_ms)
             self.set_input_state(display, PASTE_GAP_MS, self.paste_gap_ms)
             self.set_input_state(display, WAKE_WAIT_MS, game.get(WAKE_WAIT_MS, DEFAULT_WAKE_WAIT_MS))
@@ -462,6 +468,17 @@ def request_hangul_mode(enabled):
         os.replace(f"{name}.tmp", name)
 
 
+def batch_text():
+    """The text held for sending, for the Steam keyboard's input row."""
+    for display in bridge.xim_servers:
+        try:
+            with open(input_state_path(display, BATCH_TEXT), encoding="utf-8") as held:
+                return held.read()
+        except OSError:
+            pass
+    return ""
+
+
 def keyboard_mode():
     """Whether the game in focus uses the bridge, which then composes Hangul from the
     letters the Steam keyboard types, and whether Hangul mode is on."""
@@ -470,6 +487,7 @@ def keyboard_mode():
         "active": bool(game.get(PHYSICAL)),
         "hangul": hangul_mode_on(),
         "english_on_close": bool(game.get(ENGLISH_ON_CLOSE)),
+        "batch": bool(game.get(PASTE) and game.get(PASTE_BATCH)),
     }
 
 
@@ -631,6 +649,13 @@ class Plugin:
         request_hangul_mode(bool(enabled))
         await asyncio.sleep(MODE_REQUEST_WAIT_SECONDS)
         return await asyncio.to_thread(current_state)
+
+    async def get_batch_text(self):
+        """Asked for often, and only while text may be held for the input row."""
+        return await asyncio.to_thread(batch_text)
+
+    async def set_batch_row_missing(self, missing):
+        bridge.batch_row_missing = bool(missing)
 
     async def get_keyboard_mode(self):
         """What the Steam keyboard needs, often and cheaply."""

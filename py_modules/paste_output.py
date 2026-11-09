@@ -20,6 +20,10 @@ are being forwarded, and go straight back to the game. They are told from the
 player's by count: each key pressed here is expected back once. Keys the player
 types while the paste holds Ctrl lose Ctrl, which is the paste's and not theirs.
 
+Text held until Enter is pasted once, so a clash is unlikely, and it uses the real V:
+some games read keys by their place on the keyboard and take the spare key for
+nothing. It waits while the player is holding V.
+
 A key the player pressed after a syllable waits until the paste is over, so the
 order is kept. Text finished meanwhile goes in the next paste, so fast typing does
 not fall behind.
@@ -33,8 +37,9 @@ import struct
 CONTROL_L, LETTER_V, LETTER_V_UPPER = 0xFFE3, 0x0076, 0x0056
 # A key games leave alone, pressed to have a game turn its IME back on.
 WAKE_KEYSYM = 0xFFD5  # F24
-# Ctrl's keycode in the usual map, for when the map in place is someone else's.
+# Ctrl's and V's keycodes in the usual map, for when the map in place is someone else's.
 CONTROL_KEYCODE = 37
+REAL_V_KEYCODE = 55
 SELECTION_REQUEST, SELECTION_NOTIFY = 30, 31
 XA_ATOM, XA_STRING = 4, 31
 EVENT_SIZE = 192
@@ -83,6 +88,7 @@ class Paster:
         x.XDisplayKeycodes.argtypes = [void, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         x.XChangeKeyboardMapping.argtypes = [void, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ulong), ctypes.c_int]
         x.XCloseDisplay.argtypes = [void]
+        x.XQueryKeymap.argtypes = [void, ctypes.c_char_p]
         t.XTestFakeKeyEvent.argtypes = [void, ctypes.c_uint, ctypes.c_int, ulong]
 
         self._display = x.XOpenDisplay(display_name.encode())
@@ -98,6 +104,7 @@ class Paster:
         )
         self._text = b""
         self.control = x.XKeysymToKeycode(self._display, CONTROL_L) or CONTROL_KEYCODE
+        self.real_v = x.XKeysymToKeycode(self._display, LETTER_V) or REAL_V_KEYCODE
         self.v = self._spare_keycode()
         self._map_v(LETTER_V, LETTER_V_UPPER)
         self.wake = x.XKeysymToKeycode(self._display, WAKE_KEYSYM)
@@ -156,6 +163,18 @@ class Paster:
         if keysym == 0:
             self._map_v(LETTER_V, LETTER_V_UPPER)
         return False
+
+    def real_v_ready(self, must_be_up):
+        """Whether Ctrl is Ctrl and the real V is V, and up if that matters. Pressed
+        already, the X server would pass on no press of ours, and the paste would be
+        lost."""
+        if self._keysym(self.control) != CONTROL_L or self._keysym(self.real_v) != LETTER_V:
+            return False
+        if not must_be_up:
+            return True
+        keys = ctypes.create_string_buffer(32)
+        self._x.XQueryKeymap(self._display, keys)
+        return not keys.raw[self.real_v // 8] & (1 << (self.real_v % 8))
 
     def wake_ready(self):
         """Whether the wake key is F24 right now, as the Steam keyboard's own key
@@ -224,9 +243,12 @@ class PasteOutput:
         self.timers = timers
         self.paster = paster
         self.forwarding = forwarding
+        self.on_idle = lambda: None
         self.gap = DEFAULT_GAP_SECONDS
         self.queue = collections.deque()
         self.busy = False
+        self.paused = False
+        self.v = paster.v  # the key this paste presses
         self.pasting = False  # from pressing Ctrl until the paste is over
         self.ctrl_held = False  # while the paste holds Ctrl down
         self.expected = collections.Counter()  # (keycode, pressed) still to come back
@@ -237,15 +259,31 @@ class PasteOutput:
         self.restarts = 0
         self.wait_timer = None
 
-    def commit(self, text):
-        if self.queue and self.queue[-1][0] == "text":
-            self.queue[-1] = ("text", self.queue[-1][1] + text)
+    @property
+    def idle(self):
+        return not self.busy and not self.queue
+
+    def commit(self, text, real_v=False):
+        kind = "text with real v" if real_v else "text"
+        if self.queue and self.queue[-1][0] == kind:
+            self.queue[-1] = (kind, self.queue[-1][1] + text)
         else:
-            self.queue.append(("text", text))
+            self.queue.append((kind, text))
         self._run()
 
     def preedit(self, _text):
         pass
+
+    def pause(self):
+        """Keep what comes next until resume(). A paste in progress is left to
+        finish."""
+        if not self.busy:
+            self.busy = self.paused = True
+
+    def resume(self):
+        if self.paused:
+            self.busy = self.paused = False
+            self._run()
 
     def send_key(self, context, serial, event):
         """Pass a key on to the game, after any paste still on its way."""
@@ -266,7 +304,7 @@ class PasteOutput:
         if not self.pasting or not self.expected[(keycode, pressed)]:
             return False
         self.expected[(keycode, pressed)] -= 1
-        if keycode == self.paster.v and not self.v_done:
+        if keycode == self.v and not self.v_done:
             self.v_back += 1
             if self.v_back == 2 and self.wait_timer:
                 self._v_back()
@@ -277,10 +315,21 @@ class PasteOutput:
             kind, item = self.queue.popleft()
             if kind == "key":
                 self.server.send_key_back(*item)
+                # Let out together, a press and its release would land in one
+                # frame, and the game would never see the key down.
+                self.busy = True
+                self.timers.call_later(self.gap, self._key_spaced)
                 continue
             self.busy = True
+            self.v = self.paster.real_v if kind == "text with real v" else self.paster.v
             self.paster.take_clipboard(item)
             self.timers.call_later(self.gap, self._paste)
+        if self.idle:
+            self.on_idle()
+
+    def _key_spaced(self):
+        self.busy = False
+        self._run()
 
     def _press(self, keycode, pressed):
         if self.forwarding():
@@ -301,13 +350,15 @@ class PasteOutput:
     def _step(self, index, tries):
         """Press or let go of the next key, once the keys are what they should be,
         then wait a step before the one after."""
-        map_ready = self.paster.keys_ready()
+        real_v = self.v != self.paster.v
+        # Once this paste has pressed V, V is down because of it.
+        map_ready = self.paster.real_v_ready(index < 2) if real_v else self.paster.keys_ready()
         if tries < KEYS_READY_TRIES and not map_ready:
             if index == 1:
                 self.map_changed = True
             self.timers.call_later(KEYS_READY_POLL_SECONDS, lambda: self._step(index, tries + 1))
             return
-        control, v = self.paster.control, self.paster.v
+        control, v = self.paster.control, self.v
         if index == 1 and self.map_changed and self.restarts < MAX_RESTARTS:
             # Another key map came and went while Ctrl was down, which may have
             # lost it: press it again, a step before V.
