@@ -485,6 +485,8 @@ class Daemon:
             self.virtual_active = virtual
             self._steam_typing_changed()
         self._set_paste(read_flag(self.paste_file))
+        if self.overlay:
+            self.overlay.discard_events()
         self.paste_batch = read_flag(self.paste_batch_file)
         self.batch_row_missing = read_flag(self.batch_row_missing_file)
         self._update_batch()

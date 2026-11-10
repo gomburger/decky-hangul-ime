@@ -13,6 +13,7 @@ FONT_SIZE = 28
 BAR_HEIGHT = 56
 MARGIN = 20
 TEXT_BASELINE = 18
+EVENT_SIZE = 192
 REDRAW_SECONDS = 0.1  # the first drawing can come before the window is on screen
 CW_BACK_PIXEL, CW_BORDER_PIXEL, CW_OVERRIDE_REDIRECT, CW_COLORMAP = 1 << 1, 1 << 3, 1 << 9, 1 << 13
 XA_CARDINAL, PROP_MODE_REPLACE, INPUT_OUTPUT, TRUE_COLOR = 6, 0, 1, 4
@@ -85,6 +86,8 @@ class TextOverlay:
             "XFlush": (integer, [Pointer]),
             "XSync": (integer, [Pointer, integer]),
             "XCloseDisplay": (integer, [Pointer]),
+            "XPending": (integer, [Pointer]),
+            "XNextEvent": (integer, [Pointer, Pointer]),
         })
         _declare(c, {
             "cairo_xlib_surface_create": (Pointer, [Pointer, Ulong, Pointer, integer, integer]),
@@ -127,6 +130,13 @@ class TextOverlay:
             self._create_window()
             self.redraw_timer = self.timers.call_later(REDRAW_SECONDS, self._redraw)
         self._draw()
+
+    def discard_events(self):
+        """Throw away what the X server sent. Nothing is asked for, but changes of
+        key map are told to every client, and would pile up unread."""
+        event = ctypes.create_string_buffer(EVENT_SIZE)
+        while self._x.XPending(self._display):
+            self._x.XNextEvent(self._display, event)
 
     def _redraw(self):
         self.redraw_timer = None

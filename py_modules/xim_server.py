@@ -116,7 +116,11 @@ TOGGLE_KEYS = {
     "right_alt": (0xFFEA, 0),  # Alt_R
     "shift_space": (0x0020, SHIFT_MASK),  # Shift+Space
 }
-TOGGLE_DEBOUNCE_SECONDS = 0.3
+# Between two toggles. Repeats are told apart where X can say which presses are
+# repeats, and then this only covers a key that sends its press twice; otherwise
+# it is what spaces out the toggles of a key held down.
+TOGGLE_DEBOUNCE_SECONDS = 0.05
+TOGGLE_DEBOUNCE_SECONDS_WITHOUT_REPEATS = 0.3
 LOCALES = "@locale=C,POSIX,en_US,ko,ko_KR,ko_KR.UTF-8,ko_KR.utf8,en_US.UTF-8,en_US.utf8"
 TRANSPORTS = "@transport=X/"
 
@@ -166,6 +170,14 @@ class XimServer:
         if not self._display:
             raise OSError(f"cannot open X display {display_name}")
         self._root = self._x.XDefaultRootWindow(self._display)
+        # A key held down repeats as a release and a press, which would read as the
+        # toggle key let go and pressed again. Asked this way, a repeat comes as a
+        # press alone. It applies to this connection only, not to the game's keys.
+        supported = ctypes.c_int()
+        detectable = self._x.XkbSetDetectableAutoRepeat(self._display, 1, ctypes.byref(supported))
+        self._toggle_debounce = (
+            TOGGLE_DEBOUNCE_SECONDS if detectable else TOGGLE_DEBOUNCE_SECONDS_WITHOUT_REPEATS
+        )
         self._window = self._new_window()
         self._connections = {}
         self._next_property = 0
@@ -182,7 +194,9 @@ class XimServer:
         self.on_grabbed_key = lambda keycode, state, pressed: None
         self._contexts = set()
         self._forward_keys = False
-        self._grabbed = []
+        self._grabbed = {}  # keycode -> the modifiers its toggle key needs
+        self._toggle_keycode = None  # the key that last toggled
+        self._toggle_down = set()  # toggle keys held down now
         self._last_toggle = 0.0
 
         self._atom_protocol = self._atom("_XIM_PROTOCOL")
@@ -225,6 +239,7 @@ class XimServer:
         x.XSetErrorHandler.restype = void
         x.XKeysymToKeycode.restype = ctypes.c_ubyte
         x.XKeysymToKeycode.argtypes = [void, ulong]
+        x.XkbSetDetectableAutoRepeat.argtypes = [void, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
         x.XGrabKey.argtypes = [
             void, ctypes.c_int, ctypes.c_uint, ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ]
@@ -305,15 +320,29 @@ class XimServer:
         """Handle a key that came here by the toggle key's grab. While a toggle key
         is held, every other key comes this way too, and belongs to the player."""
         state, keycode = struct.unpack_from("<II", raw, KEY_EVENT_STATE_OFFSET)
-        if keycode not in self._grabbed:
+        if not self._is_toggle_key(keycode, state):
             self.on_grabbed_key(keycode, state, pressed)
         elif not pressed:
+            self._toggle_down.discard(keycode)
             self.on_toggle_released()
+        elif keycode in self._toggle_down:
+            return  # held down, repeating: one toggle per press
         else:
+            self._toggle_down.add(keycode)
+            self._toggle_keycode = keycode
             now = time.monotonic()
-            if now - self._last_toggle > TOGGLE_DEBOUNCE_SECONDS:
+            if now - self._last_toggle > self._toggle_debounce:
                 self._last_toggle = now
                 self.on_toggle()
+
+    def _is_toggle_key(self, keycode, state):
+        """Space is a toggle key only with Shift: typed plain while another toggle
+        key is down, it is the player's. The key that toggled stays one whatever is
+        held, so that it does not start typing once Shift is let go before it."""
+        if keycode not in self._grabbed:
+            return False
+        needed = self._grabbed[keycode]
+        return keycode == self._toggle_keycode or state & needed == needed
 
     def _on_selection_request(self, raw):
         requestor, selection, target, prop, when = struct.unpack_from("<QQQQQ", raw, 40)
@@ -568,13 +597,15 @@ class XimServer:
                     self._display, keycode, modifiers | lock, self._root, 0,
                     GRAB_MODE_ASYNC, GRAB_MODE_ASYNC,
                 )
-            self._grabbed.append(keycode)
+            self._grabbed[keycode] = modifiers
         self._x.XFlush(self._display)
 
     def ungrab_toggle_keys(self):
         for keycode in self._grabbed:
             self._x.XUngrabKey(self._display, keycode, ANY_MODIFIER, self._root)
-        self._grabbed = []
+        self._grabbed = {}
+        self._toggle_keycode = None
+        self._toggle_down = set()
         self._x.XFlush(self._display)
 
     def _on_sync(self, connection, body):

@@ -169,8 +169,11 @@ class PasteOutputTest(unittest.TestCase):
         path = os.path.join(tempfile.mkdtemp(), "batch-text")
         with open(path, "w", encoding="utf-8") as held:
             held.write("left behind")
+        with open(f"{path}.tmp", "w", encoding="utf-8") as held:
+            held.write("half written")
         xim_daemon.BatchDisplay(path, lambda: False, None)
         self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(f"{path}.tmp"))
 
     def test_the_spare_key_stays_for_text_as_typed(self):
         self.make()
@@ -359,7 +362,9 @@ class DaemonPasteTest(unittest.TestCase):
 
     def start_batching(self):
         shown = self.shown = []
-        overlay = type("Overlay", (), {"show": lambda _self, text: shown.append(text)})()
+        overlay = type("Overlay", (), {
+            "show": lambda _self, text: shown.append(text), "discard_events": lambda _self: None,
+        })()
         self.daemon.overlay = self.daemon.batch_display.overlay = overlay
         self.row_file = os.path.join(tempfile.mkdtemp(), "batch-text")
         self.daemon.batch_display.path = self.row_file

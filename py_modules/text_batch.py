@@ -25,10 +25,11 @@ class BatchDisplay:
         self._remove()  # what a server that was killed left behind
 
     def _remove(self):
-        try:
-            os.unlink(self.path)
-        except OSError:
-            pass
+        for path in (self.path, f"{self.path}.tmp"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _write(self, text):
         if text == self.written:
