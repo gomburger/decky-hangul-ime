@@ -52,6 +52,8 @@ const WAKE_WAIT_DEFAULT_MS = 500;
 const SHORTCUT_APP_TYPE = 1073741824;
 const STATUS_ON_COLOR = "#4caf50";
 const STATUS_OFF_COLOR = "#f44336";
+const STATUS_IDLE_COLOR = "#8b929a";
+const STATUS_WARN_COLOR = "#ffc107";
 const ADVANCED_OPEN_KEY = "hangul-ime-advanced-open";
 const LOCALE_OPTION = "HOST_LC_ALL=ko_KR.UTF-8";
 const XIM_OPTION_SET = /(^|\s)XMODIFIERS=@im=hangulbridge(?=\s|$)/;
@@ -231,14 +233,14 @@ function InfoRow({ label, value }) {
         h(DFL.Field, { label, focusable: true, ...VALUE_COLUMN }, columnValue(value)));
 }
 
-function StatusLight({ label, on }) {
+function StatusLight({ label, on, color }) {
     return h("span", { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
         h("span", {
             style: {
                 width: "10px",
                 height: "10px",
                 borderRadius: "50%",
-                background: on ? STATUS_ON_COLOR : STATUS_OFF_COLOR,
+                background: color ?? (on ? STATUS_ON_COLOR : STATUS_OFF_COLOR),
             },
         }),
         label);
@@ -482,6 +484,13 @@ function ToggleKeySection({ state, onToggleKeyChange }) {
             "Steam 키보드는 한국어·영어 자판을 함께 두면", "지구본 키가 한/영 전환 키가 돼요.")));
 }
 
+// How the Steam keyboard's Hangul last came in: grey before any, green the usual
+// way, yellow the fallback, where Steam's own composing is read back.
+function SteamKeyboardLight({ path }) {
+    if (path === "readback") return h(StatusLight, { label: "Steam 키보드 (예비)", color: STATUS_WARN_COLOR });
+    return h(StatusLight, { label: "Steam 키보드", color: path === "letters" ? STATUS_ON_COLOR : STATUS_IDLE_COLOR });
+}
+
 function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
     const [open, setOpen] = SP_REACT.useState(readAdvancedOpen);
     const processes = state?.processes ?? [];
@@ -500,7 +509,8 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
         h("div", { key: "status", style: SECTION_UNDER_BUTTON }, h(DFL.PanelSection, { title: "상태" },
             h(DFL.PanelSectionRow, null,
                 h("div", { style: { display: "flex", gap: "20px", fontSize: "14px" } },
-                    h(StatusLight, { label: "입력 서버", on: Boolean(state?.xim_running) }))),
+                    h(StatusLight, { label: "입력 서버", on: Boolean(state?.xim_running) }),
+                    h(SteamKeyboardLight, { path: state?.steam_keyboard_path }))),
             h(DFL.PanelSectionRow, null,
                 h(DFL.Field, {
                     label: labelWithNote("일시 중지", "입력 서버와 포커스 감지를 꺼요.", "다시 켜면 게임을 재시작해 주세요."),
@@ -883,6 +893,8 @@ function patchKeyboards() {
 // Steam update, the keyboard goes on typing as Steam's own.
 const KEYBOARD_MODE_POLL_MS = 500;
 const BATCH_TEXT_POLL_MS = 60;
+// Steam shows the row only with some text in it.
+const EMPTY_INPUT_ROW = " ";
 const GLOBE_KEY = "SwitchKeys_Layout";
 const KOREAN_LAYOUT = "korean";
 const LAYOUT_SWITCH_TRIES = 6;
@@ -1371,15 +1383,27 @@ function reportInputRow(found) {
     setBatchRowMissing(batchRowMissing).catch(() => {});
 }
 
+// At the top of the screen the keyboard grows downwards as the row comes, and the
+// keys move under the finger: there the row stays, empty while nothing is held.
+function keyboardAtTop(keyboard) {
+    if (keyboard.props?.VirtualKeyboardManager?.KeyboardLocation === "center-top") return true;
+    const root = keyboard.m_keyboardDiv;
+    const view = root?.ownerDocument?.defaultView;
+    if (!root || !view) return false;
+    const box = root.getBoundingClientRect();
+    return box.height > 0 && box.top + box.height / 2 < view.innerHeight / 2;
+}
+
 function followBatchText() {
     const keyboard = keyboardMode.active && keyboardMode.batch ? keyboardTypingIntoGame() : null;
     if (!keyboard || batchTextAsked) return;
     const hook = findInputRowHook(keyboard);
     reportInputRow(Boolean(hook));
     widenInputRow(keyboard);
+    const atTop = keyboardAtTop(keyboard);
     batchTextAsked = true;
     getBatchText()
-        .then((text) => setInputRow(hook, text))
+        .then((text) => setInputRow(hook, text || (atTop ? EMPTY_INPUT_ROW : "")))
         .catch(() => {})
         .finally(() => { batchTextAsked = false; });
 }

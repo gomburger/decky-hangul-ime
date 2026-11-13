@@ -21,7 +21,7 @@ if os.path.join(PLUGIN_DIR, "py_modules") not in sys.path:
     sys.path.insert(0, os.path.join(PLUGIN_DIR, "py_modules"))
 
 from state_files import (  # noqa: E402
-    BACKSPACE_HOLD_MS, BATCH_ROW_MISSING, BATCH_TEXT, DIRECT, GAME_OPTIONS, MODE, MODE_REQUEST, PASTE, PASTE_BATCH, PASTE_GAP_MS, PHYSICAL, TOGGLE_KEYS,
+    BACKSPACE_HOLD_MS, BATCH_ROW_MISSING, BATCH_TEXT, DIRECT, STEAM_PATH, GAME_OPTIONS, MODE, MODE_REQUEST, PASTE, PASTE_BATCH, PASTE_GAP_MS, PHYSICAL, TOGGLE_KEYS,
     WAKE_WAIT_MS,
     VIRTUAL, state_path,
 )
@@ -479,6 +479,17 @@ def batch_text():
     return ""
 
 
+def steam_keyboard_path():
+    """How the Steam keyboard's Hangul last came in, if it has yet."""
+    for display in bridge.xim_servers:
+        try:
+            with open(input_state_path(display, STEAM_PATH), encoding="utf-8") as noted:
+                return noted.read().strip()
+        except OSError:
+            pass
+    return ""
+
+
 def keyboard_mode():
     """Whether the game in focus uses the bridge, which then composes Hangul from the
     letters the Steam keyboard types, and whether Hangul mode is on."""
@@ -496,6 +507,7 @@ def current_state():
         "games": bridge.games,
         "active": bridge.in_game,
         "xim_running": any(is_running(p) for p in bridge.xim_servers.values()),
+        "steam_keyboard_path": steam_keyboard_path(),
         "processes": list_game_processes(),
         "keep_keyboard_on_enter": bridge.keep_keyboard_on_enter,
         "keyboard_opacity": bridge.keyboard_opacity,

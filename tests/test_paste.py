@@ -329,6 +329,8 @@ class DaemonPasteTest(unittest.TestCase):
             raise OSError("not in this test")
 
         self.originals = (xim_daemon.XimServer, xim_daemon.Paster, xim_daemon.STEAM_DISPLAY, xim_daemon.KeymapWatch)
+        self.saved_runtime = xim_daemon.RUNTIME_DIR
+        xim_daemon.RUNTIME_DIR = tempfile.mkdtemp()  # never the running daemon's files
         xim_daemon.XimServer, xim_daemon.Paster, xim_daemon.STEAM_DISPLAY = Server, Paster, ""
         xim_daemon.KeymapWatch = no_keymap
         self.daemon = xim_daemon.Daemon(":1")
@@ -340,6 +342,7 @@ class DaemonPasteTest(unittest.TestCase):
         self.daemon.ime_wake = True
 
     def tearDown(self):
+        xim_daemon.RUNTIME_DIR = self.saved_runtime
         (xim_daemon.XimServer, xim_daemon.Paster, xim_daemon.STEAM_DISPLAY,
          xim_daemon.KeymapWatch) = self.originals
 
@@ -592,6 +595,34 @@ class DaemonPasteTest(unittest.TestCase):
         self.clock.run()
         self.assertEqual(self.pastes(), ["마"])
         self.assertFalse(self.daemon.batching)
+
+    def steam_path(self):
+        try:
+            with open(self.daemon.steam_path_file, encoding="utf-8") as noted:
+                return noted.read()
+        except OSError:
+            return ""
+
+    def test_steam_keyboard_letters_are_noted_as_the_usual_way(self):
+        self.daemon.virtual_active = True
+        self.daemon.server.lookup_keysym = lambda _keycode, _state: 0
+        self.type_jamo([30, 37])
+        self.assertEqual(self.steam_path(), "letters")
+
+    def test_hangul_steam_composed_is_noted_as_the_fallback(self):
+        self.daemon.virtual_active = True
+        self.daemon.hangul_mode = False
+        self.daemon.server.lookup_keysym = lambda _keycode, _state: 0x0100AC00  # 가
+        self.press(200)
+        self.assertEqual(self.steam_path(), "readback")
+        self.daemon.server.lookup_keysym = lambda _keycode, _state: 0
+        self.daemon.hangul_mode = True
+        self.type_jamo([30, 37])
+        self.assertEqual(self.steam_path(), "letters")
+
+    def test_physical_keys_alone_note_nothing(self):
+        self.type_jamo([30, 37])
+        self.assertEqual(self.steam_path(), "")
 
     def test_switching_to_paste_and_back(self):
         daemon = self.daemon

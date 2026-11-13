@@ -365,6 +365,9 @@ class Daemon:
         self.paste_file = path(state_files.PASTE)
         self.paste_batch_file = path(state_files.PASTE_BATCH)
         self.batch_row_missing_file = path(state_files.BATCH_ROW_MISSING)
+        self.steam_path_file = path(state_files.STEAM_PATH)
+        self.steam_path = None
+        self._remove_steam_path()
         if self.paste_output:
             self.batch_display = BatchDisplay(path(state_files.BATCH_TEXT), lambda: self.steam_typing, self.overlay)
             self.batch = TextBatch(self.paste_output, self.batch_display)
@@ -632,6 +635,23 @@ class Daemon:
         if self.physical_active:
             self._set_hangul_mode(wanted == "1")
 
+    def _note_steam_path(self, way):
+        """Tell the plugin how the Steam keyboard's Hangul came in, when that changes."""
+        if way == self.steam_path:
+            return
+        self.steam_path = way
+        try:
+            with open(self.steam_path_file, "w", encoding="utf-8") as noted:
+                noted.write(way)
+        except OSError:
+            pass
+
+    def _remove_steam_path(self):
+        try:
+            os.unlink(self.steam_path_file)
+        except OSError:
+            pass
+
     def _take_key(self, keycode, code, state):
         """Handle a key press here, returning False if it should go to the game."""
         if code in MODIFIER_CODES:
@@ -643,6 +663,7 @@ class Daemon:
                 keysym = self.keymap.take(keycode, keysym)
             text = hangul_text(keysym)
             if text:
+                self._note_steam_path(state_files.STEAM_PATH_READBACK)
                 self.steam.on_text(text)
                 return True
             if keysym == BACKSPACE_KEYSYM and self.steam.on_backspace():
@@ -651,6 +672,8 @@ class Daemon:
         if self.batching and self._batch_key(keycode, code, state, keysym):
             return True
         if self.hangul_mode and self.session.physical_key(code, state):
+            if self.steam_typing:
+                self._note_steam_path(state_files.STEAM_PATH_LETTERS)
             return True
         if self.batching:
             self.batch.flush()  # before the key, which then follows the paste
@@ -809,6 +832,7 @@ class Daemon:
             self.paster.close()
         if self.batch_display:
             self.batch_display.show("")
+        self._remove_steam_path()
         if self.overlay:
             self.overlay.close()
         if self.keymap:

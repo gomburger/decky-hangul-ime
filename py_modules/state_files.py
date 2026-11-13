@@ -30,6 +30,11 @@ BATCH_ROW_MISSING = "batch_row_missing"
 # Written by the daemon, readable only by this user: the text held for sending, for
 # the Steam keyboard's input row. Only there while there is such text.
 BATCH_TEXT = "batch-text"
+# Written by the daemon: how the Steam keyboard's Hangul last came in, as one of
+# the words below. No text, only the way.
+STEAM_PATH = "steam-path"
+STEAM_PATH_LETTERS = "letters"  # letters the plugin turned the jamo keys into, composed here
+STEAM_PATH_READBACK = "readback"  # Hangul Steam composed, read back: the fallback
 # Written by the daemon: whether physical keys are typing Hangul.
 MODE = "mode"
 # Written by the plugin: the mode its button asks for, removed by the daemon once read.
