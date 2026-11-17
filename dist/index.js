@@ -277,7 +277,7 @@ function LocaleOptionSection() {
     };
     return h(DFL.PanelSection, { title: "실행 옵션" },
         h(ToggleRow, {
-            label: labelWithNote("한국어 환경으로 실행", LOCALE_OPTION, "글자가 깨지면 켜주세요.", "현재 게임에만 적용돼요."),
+            label: labelWithNote("한국어 환경으로 실행", LOCALE_OPTION, "글자가 깨지면 켜주세요. 현재 게임에만 적용돼요."),
             value: enabled === true,
             disabled: enabled === null,
             onChange,
@@ -311,6 +311,125 @@ function GameSection({ state, runningAppId, onRemove }) {
                     running: runningApps.has(appId),
                     onRemove,
                 }))));
+}
+
+// The ways of sending text, as the picker lists them, each with what it does.
+const SEND_METHOD_CHOICES = [
+    { data: "ime", label: "기본 (IME)", about: ["조합 중인 글자를 게임 입력창에 보여 줘요.", "Windows와 같은 방식이에요."] },
+    {
+        data: "direct",
+        label: "조합 중 글자 바로 입력",
+        about: ["조합 중인 글자가 입력창에 안 보이고", "조합 창이 따로 뜨는 게임에서 써요.", "Steam 가상 키보드와 같은 방식이에요."],
+    },
+    {
+        data: "paste",
+        label: "붙여넣기로 입력",
+        about: ["IME로 한글 입력이 안 되는 게임에서 써요.", "클립보드에 글자를 올려 Ctrl+V로 입력해요.", "Ctrl+V가 되는 게임이면 대부분 쓸 수 있어요."],
+    },
+];
+
+// When the picker was opened and closed: the panel built anew after it gives focus
+// back to the button. Kept here, as the panel itself is taken down meanwhile.
+let pickerOpenedAt = 0;
+let pickerClosedAt = 0;
+const PICKER_RETURN_MS = 5000;
+const FOCUS_SETTLE_MS = [60, 300];
+// The press that closed the picker reaches the menu once more as it shows again,
+// within 90ms; it would open the picker again. No hand presses that soon.
+let pickerReturnedAt = 0;
+const PICKER_ECHO_MS = 150;
+
+function pickerJustClosed() {
+    return pickerOpenedAt > 0 && (pickerClosedAt === 0 || Date.now() - pickerClosedAt < PICKER_RETURN_MS);
+}
+
+// Give focus to what is in an element the way the controller would, through the
+// navigation node Steam keeps for it: a browser focus moves the highlight, but not
+// where the next press of up or down starts from.
+function takeSteamFocus(element) {
+    const target = element?.querySelector?.("button, [tabindex]") ?? element;
+    if (!target) return;
+    const fiberKey = Object.keys(target).find((key) => key.startsWith("__reactFiber$"));
+    for (let fiber = fiberKey ? target[fiberKey] : null, level = 0; fiber && level < 30; fiber = fiber.return, level++) {
+        for (let hook = fiber.memoizedState; hook && typeof hook === "object"; hook = hook.next) {
+            const node = hook.memoizedState?.current;
+            if (node && typeof node.TakeFocus === "function") {
+                node.TakeFocus();
+                return;
+            }
+        }
+    }
+    target.focus?.();
+}
+
+// Once the page shows, Steam picks where focus goes; this comes just after it.
+function focusOnceShown(element) {
+    const page = element?.ownerDocument;
+    if (!page) return undefined;
+    const timers = [];
+    const focusSoon = () => {
+        pickerReturnedAt = Date.now();
+        for (const delay of FOCUS_SETTLE_MS) timers.push(setTimeout(() => takeSteamFocus(element), delay));
+    };
+    const onShown = () => {
+        if (page.visibilityState !== "visible") return;
+        page.removeEventListener("visibilitychange", onShown);
+        focusSoon();
+    };
+    if (page.visibilityState === "visible") focusSoon();
+    else page.addEventListener("visibilitychange", onShown);
+    return () => {
+        page.removeEventListener("visibilitychange", onShown);
+        timers.forEach(clearTimeout);
+    };
+}
+
+// Steam sizes a dialog at 660px, much wider than three short choices need.
+const PICKER_CLASS = "hangul-ime-method-picker";
+const PICKER_STYLE_ID = "hangul-ime-method-picker-style";
+const PICKER_MARK_WIDTH = "22px";
+const PICKER_CSS = `.${PICKER_CLASS}{width:440px !important;max-width:calc(100vw - 48px) !important;}`;
+
+function stylePicker() {
+    for (const target of steamDocuments()) {
+        if (target.getElementById(PICKER_STYLE_ID)) continue;
+        const style = target.createElement("style");
+        style.id = PICKER_STYLE_ID;
+        style.textContent = PICKER_CSS;
+        target.head.appendChild(style);
+    }
+}
+
+function removePickerStyle() {
+    for (const target of steamDocuments()) target.getElementById(PICKER_STYLE_ID)?.remove();
+}
+
+const PICKER_BUTTON = { padding: "8px 12px", minWidth: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" };
+
+// Each way with what it does, the one in use marked and focused first.
+function SendMethodPicker({ closeModal, selected, onPick, onClose }) {
+    const close = () => {
+        onClose();
+        closeModal();
+    };
+    const pick = (choice) => {
+        close();
+        if (choice !== selected) onPick(choice);
+    };
+    return h(DFL.ModalRoot, { className: PICKER_CLASS, closeModal: close, onCancel: close },
+        h("div", { style: { fontSize: "20px", fontWeight: "bold", marginBottom: "8px" } }, "글자 보내는 방식"),
+        h(DFL.Focusable, { "flow-children": "vertical", style: { display: "flex", flexDirection: "column", gap: "4px" } },
+            ...SEND_METHOD_CHOICES.map((choice) => h(DFL.DialogButton, {
+                key: choice.data,
+                style: { padding: "8px 12px", minWidth: 0, width: "100%", textAlign: "left" },
+                autoFocus: choice.data === selected,
+                onClick: () => pick(choice.data),
+            },
+                // The mark has a place of its own on every choice, so the names line up.
+                h("div", { style: { display: "flex", alignItems: "baseline" } },
+                    h("span", { style: { width: PICKER_MARK_WIDTH, flexShrink: 0, color: STATUS_ON_COLOR } }, choice.data === selected ? "✓" : ""),
+                    h("span", null, choice.label)),
+                ...choice.about.map((line) => h("div", { key: line, style: { paddingLeft: PICKER_MARK_WIDTH, fontSize: "12px", lineHeight: NOTE_LINE_HEIGHT, color: "#8b929a" } }, line))))));
 }
 
 function sendMethod(game) {
@@ -382,7 +501,7 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
             inUse: holdInUse,
             onChange: onHoldChange,
         }),
-        noteRow("글자가 꼬이거나 지워지지 않으면 늘려주세요.", `(기본값 ${BACKSPACE_HOLD_DEFAULT_MS}ms)`),
+        ClosingNote("글자가 꼬이거나 지워지지 않으면 늘려주세요.", "FPS가 낮은 게임에서는 늘려주세요.", `(기본값 ${BACKSPACE_HOLD_DEFAULT_MS}ms, 30FPS 기준)`),
         h(ToggleRow, {
             label: labelWithNote("지연 시간 줄이기", "백스페이스를 누르지 않고 문자로 보내요.", "글자가 쌓이거나 □가 보이면 꺼주세요."),
             value: Boolean(game?.erase_text),
@@ -407,7 +526,7 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
             inUse: true,
             onChange: onPasteGapChange,
         }),
-        ClosingNote("글자가 빠지면 늘려주세요.", `(기본값 ${PASTE_GAP_DEFAULT_MS}ms, 30fps까지 안정)`),
+        ClosingNote("글자가 빠지면 늘려주세요.", "FPS가 낮은 게임에서는 늘려주세요.", `(기본값 ${PASTE_GAP_DEFAULT_MS}ms, 30FPS 기준)`),
     ] : [];
     // A paste presses keys of its own, so it needs no waking.
     const imeWake = Boolean(game?.ime_wake);
@@ -429,26 +548,50 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
                 inUse: true,
                 onChange: onWakeWaitChange,
             }),
-            ClosingNote("글자가 빠지면 늘려주세요.", `(기본값 ${WAKE_WAIT_DEFAULT_MS}ms)`),
+            ClosingNote("입력창을 다시 열었을 때", "한글이 입력되지 않으면 늘려주세요.", `(기본값 ${WAKE_WAIT_DEFAULT_MS}ms)`),
         ] : []),
     ];
+    const chosen = SEND_METHOD_CHOICES.find((choice) => choice.data === method) ?? SEND_METHOD_CHOICES[0];
+    // A picker over the Quick Access menu hides it, and the panel is taken down and
+    // built anew once it shows again; Steam then puts focus further down. The new
+    // button takes it back once the menu shows.
+    const pickerButton = SP_REACT.useRef(null);
+    SP_REACT.useEffect(() => {
+        if (!pickerJustClosed()) return undefined;
+        pickerOpenedAt = 0;
+        return focusOnceShown(pickerButton.current);
+    }, []);
+    const openPicker = () => {
+        if (Date.now() - pickerReturnedAt < PICKER_ECHO_MS) return;
+        stylePicker();
+        pickerOpenedAt = Date.now();
+        pickerClosedAt = 0;
+        DFL.showModal(h(SendMethodPicker, {
+            selected: method,
+            onPick: (choice) => onMethodChange(choice),
+            onClose: () => { pickerClosedAt = Date.now(); },
+        }));
+    };
     return h(SP_REACT.Fragment, null,
-        h(ToggleRow, {
-            label: labelWithNote("조합 중 글자 바로 입력", "조합 창이 따로 뜨는 게임에서 켜주세요."),
-            value: direct,
-            disabled: !isEnabled,
-            onChange: (on) => onMethodChange(on ? "direct" : "ime"),
-        }),
+        h(DFL.PanelSectionRow, { key: "method" },
+            h(DFL.Field, {
+                label: "글자 보내는 방식",
+                childrenLayout: "below",
+                childrenContainerWidth: "max",
+                bottomSeparator: "none",
+            },
+                h("div", { ref: pickerButton, style: { width: "100%" } }, h(DFL.DialogButton, {
+                    style: PICKER_BUTTON,
+                    disabled: !isEnabled,
+                    onClick: openPicker,
+                },
+                    h("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 } }, chosen.label),
+                    h("span", { style: { flexShrink: 0, opacity: 0.7 } }, "▾"))))),
+        // What the chosen way does, and when it suits.
+        h(SP_REACT.Fragment, { key: `about-${method}` }, noteRow(...chosen.about)),
         // Each group has a place of its own: spread side by side, the steppers' row
         // keys would clash, and React would leave rows behind.
         h(SP_REACT.Fragment, { key: "directSettings" }, ...directSettings),
-        h(ToggleRow, {
-            label: labelWithNote("붙여넣기로 입력", "IME로 한글이 안 되는 게임에서 켜주세요.", "클립보드가 바뀌고 조합 중 글자는 안 보여요."),
-            value: paste,
-            disabled: !isEnabled,
-            onChange: (on) => onMethodChange(on ? "paste" : "ime"),
-            separator: !paste,
-        }),
         h(SP_REACT.Fragment, { key: "pasteSettings" }, ...pasteSettings),
         h(SP_REACT.Fragment, { key: "wakeSettings" }, ...(paste ? [] : wakeSettings)));
 }
@@ -482,14 +625,14 @@ function ToggleKeySection({ state, onToggleKeyChange }) {
             onChange: (enabled) => onToggleKeyChange(name, enabled),
         })),
         ClosingNote("꺼 둔 키는 게임에 그대로 들어가요.", "모두 끄면 가/A 버튼이나 지구본 키로 바꿔요.",
-            "Steam 키보드는 한국어·영어 자판을 함께 두면", "지구본 키가 한/영 전환 키가 돼요.")));
+            "Steam 가상 키보드는 한국어·영어 자판을", "함께 두면 지구본 키가 한/영 전환 키가 돼요.")));
 }
 
 // How the Steam keyboard's Hangul last came in: grey before any, green the usual
 // way, yellow the fallback, where Steam's own composing is read back.
 function SteamKeyboardLight({ path }) {
-    if (path === "readback") return h(StatusLight, { label: "Steam 키보드 (예비)", color: STATUS_WARN_COLOR });
-    return h(StatusLight, { label: "Steam 키보드", color: path === "letters" ? STATUS_ON_COLOR : STATUS_IDLE_COLOR });
+    if (path === "readback") return h(StatusLight, { label: "Steam 가상 키보드 (예비)", color: STATUS_WARN_COLOR });
+    return h(StatusLight, { label: "Steam 가상 키보드", color: path === "letters" ? STATUS_ON_COLOR : STATUS_IDLE_COLOR });
 }
 
 function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
@@ -536,8 +679,17 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
     ];
 }
 
+// The panel as last seen. The Quick Access menu builds the panel anew each time it
+// opens, and Steam puts focus back where it was by place: drawn first without the
+// game's rows, the panel would grow under it, and focus would land further down.
+let lastPanelState = null;
+
 function App() {
-    const [state, setState] = SP_REACT.useState(null);
+    const [state, setStateHere] = SP_REACT.useState(() => lastPanelState);
+    const setState = (next) => {
+        lastPanelState = next;
+        setStateHere(next);
+    };
     const [message, setMessage] = SP_REACT.useState("");
     const [restartNotice, setRestartNotice] = SP_REACT.useState("");
     const [opacityDraft, setOpacityDraft] = SP_REACT.useState(null);
@@ -803,7 +955,7 @@ function App() {
                 })),
             // Only while the keyboard is see-through, which is when it matters.
             opacityInUse && h(ToggleRow, {
-                label: labelWithNote("데스크톱 모드에서 끄기", "키보드 불투명도를 게임 모드에서만 써요."),
+                label: labelWithNote("데스크톱 모드에서 끄기", "키보드 불투명도를 게임 모드에만 적용해요."),
                 value: Boolean(state?.opacity_off_on_desktop),
                 onChange: onOpacityOffOnDesktopChange,
             }))),
@@ -920,6 +1072,7 @@ let convenienceTimer = null;
 function loadConvenienceSettings() {
     getState()
         .then((state) => {
+            lastPanelState = lastPanelState ?? state;
             keepKeyboardOnEnter = Boolean(state.keep_keyboard_on_enter);
             followOpacitySettings(state);
         })
@@ -1506,6 +1659,7 @@ var index = DFL.definePlugin(() => {
         content: h(App, null),
         icon: h("span", { style: { fontWeight: "bold" } }, "한"),
         onDismount() {
+            removePickerStyle();
             clearTimeout(convenienceTimer);
             clearInterval(timer);
             clearInterval(keyboardTimer);
