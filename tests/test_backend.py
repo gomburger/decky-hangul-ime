@@ -224,6 +224,89 @@ class BackendTest(unittest.TestCase):
         self.assertFalse(fresh.games["3"]["paste_batch"])
         self.assertTrue(self.backend.clean_game({"virtual": True})["paste_batch"])
 
+    def test_a_game_running_without_the_option_is_left_alone(self):
+        plugin, bridge, run = self.backend.Plugin, self.backend.bridge, asyncio.run
+        run(plugin.set_game_enabled(plugin, "3", True))
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": False}]
+        self.backend.list_game_processes = lambda: programs
+        bridge.in_game, bridge.active_game = True, "3"
+        bridge.unlinked = bridge.game_unlinked("3")
+        self.assertTrue(bridge.unlinked)
+        self.assertFalse(run(plugin.get_keyboard_mode(plugin))["active"])
+        state = run(plugin.get_state(plugin))
+        self.assertEqual(state["unlinked_game"], "3")
+        self.assertFalse(state["active"])
+
+    def test_link_is_looked_at_again_after_a_while(self):
+        bridge = self.backend.bridge
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": False}]
+        self.backend.list_game_processes = lambda: programs
+        self.assertTrue(bridge.game_unlinked("3"))
+        programs[0]["has_xim_option"] = True  # restarted with the option
+        self.assertTrue(bridge.game_unlinked("3"))  # not looked at again yet
+        bridge.link_checked = ("3", -100.0, True)
+        self.assertFalse(bridge.game_unlinked("3"))
+
+    def test_a_game_with_no_program_found_counts_as_linked(self):
+        self.backend.list_game_processes = lambda: []
+        self.assertFalse(self.backend.bridge.game_unlinked("3"))
+
+    def test_an_input_server_that_keeps_stopping_is_started_less_often(self):
+        bridge = self.backend.bridge
+
+        class Stopped:
+            def poll(self):
+                return 1
+
+        bridge.daemon_started[":1"] = 100.0
+        bridge.daemon_stopped(":1", Stopped(), 101.0)
+        self.assertEqual(bridge.daemon_retry_at[":1"], 103.0)  # 2 s
+        bridge.daemon_started[":1"] = 103.0
+        bridge.daemon_stopped(":1", Stopped(), 104.0)
+        self.assertEqual(bridge.daemon_retry_at[":1"], 108.0)  # 4 s
+        for _ in range(10):
+            bridge.daemon_started[":1"] = 200.0
+            bridge.daemon_stopped(":1", Stopped(), 201.0)
+        self.assertEqual(bridge.daemon_retry_at[":1"], 201.0 + self.backend.DAEMON_RETRY_MAX_SECONDS)
+        bridge.daemon_started[":1"] = 300.0
+        bridge.daemon_stopped(":1", Stopped(), 400.0)  # ran a long while first
+        self.assertEqual(bridge.daemon_retry_at[":1"], 400.0)
+
+    def test_only_the_error_name_is_kept(self):
+        path = self.backend.daemon_error_path(":1")
+        with open(path, "w", encoding="utf-8") as errors:
+            errors.write("Traceback (most recent call last):\n  File x\nValueError: some typed text\n")
+        self.assertEqual(self.backend.daemon_exit_reason(":1"), "ValueError")
+        with open(path, "w", encoding="utf-8") as errors:
+            errors.write("")
+        self.assertEqual(self.backend.daemon_exit_reason(":1"), "no error output")
+
+    def test_a_display_left_behind_is_not_served(self):
+        import socket
+        directory = tempfile.mkdtemp()
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(os.path.join(directory, "X1"))
+        stale.close()  # the file stays, with nothing listening
+        self.assertFalse(self.backend.display_served(":1", directory))
+        live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        live.bind(os.path.join(directory, "X2"))
+        live.listen(1)
+        try:
+            self.assertTrue(self.backend.display_served(":2", directory))
+        finally:
+            live.close()
+        self.assertFalse(self.backend.display_served(":3", directory))
+
+    def test_opacity_off_on_desktop_is_kept(self):
+        plugin, run = self.backend.Plugin, asyncio.run
+        state = run(plugin.get_state(plugin))
+        self.assertFalse(state["opacity_off_on_desktop"])
+        self.assertIn("desktop_mode", state)
+        self.assertTrue(run(plugin.set_opacity_off_on_desktop(plugin, True))["opacity_off_on_desktop"])
+        fresh = self.backend.Bridge()
+        fresh.load()
+        self.assertTrue(fresh.opacity_off_on_desktop)
+
     def test_older_settings_load_without_paste(self):
         import json
         os.makedirs(os.path.dirname(self.backend.SETTINGS_FILE), exist_ok=True)

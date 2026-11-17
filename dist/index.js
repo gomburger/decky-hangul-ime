@@ -21,6 +21,7 @@ const setGameSetting = callable("set_game_setting");
 const removeGame = callable("remove_game");
 const setKeepKeyboard = callable("set_keep_keyboard_on_enter");
 const setOpacity = callable("set_keyboard_opacity");
+const setOpacityOffOnDesktop = callable("set_opacity_off_on_desktop");
 const setPaused = callable("set_paused");
 const setBackspaceHold = callable("set_backspace_hold_ms");
 const setSendMethod = callable("set_send_method");
@@ -544,6 +545,8 @@ function App() {
     const appId = app?.appid ? String(app.appid) : null;
     const game = appId ? state?.games?.[appId] : null;
     const isEnabled = Boolean(game);
+    // Running without the launch option, which the game reads only as it starts.
+    const unlinked = isEnabled && state?.unlinked_game != null && String(state.unlinked_game) === String(appId);
 
     SP_REACT.useEffect(() => {
         let active = true;
@@ -588,6 +591,18 @@ function App() {
             setMessage(`설정하지 못했어요: ${error?.message ?? error}`);
         }
     };
+
+    const onOpacityOffOnDesktopChange = async (enabled) => {
+        try {
+            const next = await setOpacityOffOnDesktop(enabled);
+            setState(next);
+            followOpacitySettings(next);
+        }
+        catch (error) {
+            setMessage(`설정하지 못했어요: ${error?.message ?? error}`);
+        }
+    };
+    const opacityInUse = opacity < KEYBOARD_OPACITY_MAX;
 
     const onPausedChange = async (paused) => {
         try {
@@ -683,6 +698,17 @@ function App() {
         }
     };
 
+    const onRestoreLaunchOption = async () => {
+        setMessage("");
+        try {
+            await applyLaunchOptions(app, true);
+            setRestartNotice("실행 옵션을 복구했어요. 게임을 다시 켜야 적용돼요.");
+        }
+        catch (error) {
+            setMessage(`복구하지 못했어요: ${error?.message ?? error}`);
+        }
+    };
+
     const onUseToggle = async (enabled) => {
         setMessage("");
         try {
@@ -701,9 +727,16 @@ function App() {
 
     return h(SP_REACT.Fragment, null,
         h(DFL.PanelSection, { title: app?.display_name || "한글 입력" },
-            h(DFL.PanelSectionRow, null,
-                h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: "#8b929a" } },
-                    statusText(state, isEnabled, app))),
+            unlinked
+                ? h(DFL.PanelSectionRow, null,
+                    h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: STATUS_WARN_COLOR } },
+                        h("div", null, "실행 옵션이 적용되지 않았어요."),
+                        h("div", null, "복구 후 게임을 다시 실행해 주세요.")))
+                : h(DFL.PanelSectionRow, null,
+                    h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: "#8b929a" } },
+                        statusText(state, isEnabled, app))),
+            unlinked && h(DFL.PanelSectionRow, null,
+                h(DFL.ButtonItem, { layout: "below", onClick: onRestoreLaunchOption }, "실행 옵션 복구")),
             restartNotice && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, restartNotice)),
             message && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, message)),
             h(DFL.PanelSectionRow, null,
@@ -765,8 +798,15 @@ function App() {
                     min: KEYBOARD_OPACITY_MIN,
                     max: KEYBOARD_OPACITY_MAX,
                     step: KEYBOARD_OPACITY_STEP,
+                    bottomSeparator: opacityInUse ? "none" : "standard",
                     onChange: onOpacityChange,
-                })))),
+                })),
+            // Only while the keyboard is see-through, which is when it matters.
+            opacityInUse && h(ToggleRow, {
+                label: labelWithNote("데스크톱 모드에서 끄기", "키보드 불투명도를 게임 모드에서만 써요."),
+                value: Boolean(state?.opacity_off_on_desktop),
+                onChange: onOpacityOffOnDesktopChange,
+            }))),
         h(AdvancedSections, {
             state,
             onPausedChange,
@@ -781,6 +821,9 @@ function App() {
 const keptOpen = new Set();
 let keepKeyboardOnEnter = true;
 let keyboardOpacity = KEYBOARD_OPACITY_MAX;
+const CONVENIENCE_RETRY_MS = 3000;
+// On the desktop, where that is asked for, the keyboard keeps its own opacity.
+let opacityOffHere = false;
 const OPACITY_STYLE_ID = "hangul-ime-keyboard-opacity";
 
 function keepKeyboardOpen(manager) {
@@ -843,7 +886,7 @@ function steamDocuments() {
 
 function applyKeyboardOpacity() {
     const classes = findKeyboardClasses();
-    const css = keyboardOpacity >= KEYBOARD_OPACITY_MAX || classes.length === 0
+    const css = opacityOffHere || keyboardOpacity >= KEYBOARD_OPACITY_MAX || classes.length === 0
         ? ""
         : `${classes.map((name) => `.${name}`).join(",")}{opacity:${keyboardOpacity / 100} !important;}`;
     for (const target of steamDocuments()) {
@@ -864,17 +907,34 @@ function removeKeyboardOpacity() {
     }
 }
 
+function followOpacitySettings(state) {
+    keyboardOpacity = state.keyboard_opacity;
+    opacityOffHere = Boolean(state.desktop_mode && state.opacity_off_on_desktop);
+    applyKeyboardOpacity();
+}
+
+// The convenience settings, read once as the plugin loads: only this panel changes
+// them afterwards, and it sets them here as it does. Whether Steam is on the desktop
+// holds until Steam starts again, which loads the plugin again too.
+let convenienceTimer = null;
+function loadConvenienceSettings() {
+    getState()
+        .then((state) => {
+            keepKeyboardOnEnter = Boolean(state.keep_keyboard_on_enter);
+            followOpacitySettings(state);
+        })
+        .catch(() => {
+            convenienceTimer = setTimeout(loadConvenienceSettings, CONVENIENCE_RETRY_MS);
+        });
+}
+
+// Windows come and go, the keyboard's own on the desktop among them: each gets the
+// Enter setting and the opacity style, from the values kept here.
 function patchKeyboards() {
     window.SteamUIStore?.WindowStore?.SteamUIWindows?.forEach((steamWindow) => {
         keepKeyboardOpen(steamWindow.VirtualKeyboardManager);
     });
     applyKeyboardOpacity();
-    getState()
-        .then((state) => {
-            keepKeyboardOnEnter = state.keep_keyboard_on_enter;
-            keyboardOpacity = state.keyboard_opacity;
-        })
-        .catch(() => {});
 }
 
 // The Steam keyboard, in a game that uses the bridge. Its Korean layout types each
@@ -1433,6 +1493,7 @@ function restoreKeyboardLook() {
 }
 
 var index = DFL.definePlugin(() => {
+    loadConvenienceSettings();
     patchKeyboards();
     const timer = setInterval(patchKeyboards, 3000);
     const keyboardTimer = setInterval(followKeyboardMode, KEYBOARD_MODE_POLL_MS);
@@ -1445,6 +1506,7 @@ var index = DFL.definePlugin(() => {
         content: h(App, null),
         icon: h("span", { style: { fontWeight: "bold" } }, "한"),
         onDismount() {
+            clearTimeout(convenienceTimer);
             clearInterval(timer);
             clearInterval(keyboardTimer);
             clearInterval(batchTextTimer);

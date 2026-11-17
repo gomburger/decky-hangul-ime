@@ -12,8 +12,10 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
+import time
 
 PLUGIN_DIR = os.environ.get("DECKY_PLUGIN_DIR", os.path.dirname(os.path.abspath(__file__)))
 # Decky puts py_modules on the path; this also covers loading main.py on its own.
@@ -37,6 +39,12 @@ MODE_REQUEST_WAIT_SECONDS = 0.3  # the daemon checks for a request every 0.25 s
 MODE_POLL_SECONDS = 0.05
 MODE_SETTLE_SECONDS = 0.8
 XIM_MODIFIER = b"@im=hangulbridge"
+# How often to look again whether the focused game was started with the launch option.
+LINK_CHECK_SECONDS = 5.0
+# An input server stopping sooner than this after its start counts as failing.
+DAEMON_QUICK_STOP_SECONDS = 10.0
+DAEMON_RETRY_MAX_SECONDS = 60
+DISPLAY_PROBE_SECONDS = 0.2
 # How long direct mode holds Backspace before typing what replaces the text.
 DEFAULT_BACKSPACE_HOLD_MS = 50
 MIN_BACKSPACE_HOLD_MS = 10
@@ -111,6 +119,25 @@ def clamp_paste_gap(value):
         return DEFAULT_PASTE_GAP_MS
 
 
+def steam_in_desktop_mode():
+    """Whether Steam runs on the desktop rather than in game mode, where gamescope
+    starts it. Unknown counts as game mode."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as comm:
+                if comm.read().strip() != "steam":
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as environ:
+                entries = environ.read().split(b"\0")
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith(b"XDG_CURRENT_DESKTOP="):
+                return entry.split(b"=", 1)[1] != b"gamescope"
+        return False
+    return False
+
+
 def clamp_keyboard_opacity(value):
     try:
         return max(MIN_KEYBOARD_OPACITY, min(MAX_KEYBOARD_OPACITY, int(value)))
@@ -150,12 +177,33 @@ def run_host(args, display=None):
     return result.stdout if result.returncode == 0 else None
 
 
+X11_SOCKET_DIR = "/tmp/.X11-unix"
+
+
 def list_displays():
     try:
-        names = os.listdir("/tmp/.X11-unix")
+        names = os.listdir(X11_SOCKET_DIR)
     except OSError:
         return []
     return sorted(f":{name[1:]}" for name in names if name.startswith("X"))
+
+
+def display_served(display, directory=None):
+    """Whether an X server answers on a display. Leaving game mode, gamescope's second
+    display can leave its socket file behind with nothing behind it, and an input
+    server started there would stop at once, over and over."""
+    path = os.path.join(directory or X11_SOCKET_DIR, f"X{display.lstrip(':')}")
+    for address in (path, "\0" + path):  # the file, and the same name unnamed
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(DISPLAY_PROBE_SECONDS)
+        try:
+            probe.connect(address)
+            return True
+        except OSError:
+            pass
+        finally:
+            probe.close()
+    return False
 
 
 def steam_display():
@@ -204,14 +252,35 @@ def stop(process):
         process.wait()
 
 
+def daemon_error_path(display):
+    """Where an input server's errors go: memory only, readable by this user."""
+    return state_path(runtime_dir(), display, "daemon-error")
+
+
 def start(args, display, steam_display):
     log.info("starting %s on %s", args[-1], display)
-    return subprocess.Popen(
-        args,
-        env=host_env(display, steam_display),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    descriptor = os.open(daemon_error_path(display), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as errors:
+        return subprocess.Popen(
+            args,
+            env=host_env(display, steam_display),
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+        )
+
+
+def daemon_exit_reason(display):
+    """The kind of error an input server stopped with, from the last line of its
+    errors: only the exception's name, never its message, which could hold text."""
+    try:
+        with open(daemon_error_path(display), encoding="utf-8", errors="replace") as errors:
+            lines = [line.strip() for line in errors if line.strip()]
+    except OSError:
+        return "no error output"
+    if not lines:
+        return "no error output"
+    name = lines[-1].split(":", 1)[0]
+    return name if name.replace(".", "").replace("_", "").isalnum() else "unknown error"
 
 
 def stop_leftover_daemons():
@@ -251,8 +320,13 @@ class Bridge:
         self.games = {}  # the current account's: app id -> {option: value}
         self.legacy_games = {}  # saved before games were kept per account
         self.batch_row_missing = False  # the Steam keyboard's input row was not found
+        # The focused game runs without the launch option, so it never reaches the
+        # input server: the bridge leaves it alone, keys and Steam keyboard as they are.
+        self.unlinked = False
+        self.link_checked = (None, 0.0, False)  # (app id, when, unlinked)
         self.keep_keyboard_on_enter = True
         self.keyboard_opacity = DEFAULT_KEYBOARD_OPACITY
+        self.opacity_off_on_desktop = False
         self.backspace_hold_ms = DEFAULT_BACKSPACE_HOLD_MS
         self.paste_gap_ms = DEFAULT_PASTE_GAP_MS
         self.toggle_keys = list(TOGGLE_KEY_NAMES)
@@ -262,6 +336,10 @@ class Bridge:
         self.in_game = False
         self.input_state = {}  # (display, input type) -> bool
         self.xim_servers = {}
+        # An input server that keeps stopping is started again less and less often.
+        self.daemon_started = {}  # display -> when
+        self.daemon_failures = {}  # display -> quick stops in a row
+        self.daemon_retry_at = {}  # display -> not before then
 
     def load(self):
         try:
@@ -277,6 +355,7 @@ class Bridge:
         self.keyboard_opacity = clamp_keyboard_opacity(
             saved.get("keyboard_opacity", DEFAULT_KEYBOARD_OPACITY)
         )
+        self.opacity_off_on_desktop = bool(saved.get("opacity_off_on_desktop", False))
         self.backspace_hold_ms = clamp_backspace_hold(
             saved.get("backspace_hold_ms", DEFAULT_BACKSPACE_HOLD_MS)
         )
@@ -296,6 +375,7 @@ class Bridge:
                     "legacy_games": self.legacy_games,
                     "keep_keyboard_on_enter": self.keep_keyboard_on_enter,
                     "keyboard_opacity": self.keyboard_opacity,
+                    "opacity_off_on_desktop": self.opacity_off_on_desktop,
                     "backspace_hold_ms": self.backspace_hold_ms,
                     "paste_gap_ms": self.paste_gap_ms,
                     "toggle_keys": self.toggle_keys,
@@ -339,11 +419,22 @@ class Bridge:
             if display not in game_displays:
                 stop(process)
                 del self.xim_servers[display]
+        now = time.monotonic()
         for display in game_displays:
-            if not is_running(self.xim_servers.get(display)):
-                self.xim_servers[display] = start(
-                    ["/usr/bin/python3", DAEMON_SCRIPT, display], display, ui_display
-                )
+            process = self.xim_servers.get(display)
+            if is_running(process):
+                continue
+            if not display_served(display):
+                continue
+            if process is not None and display not in self.daemon_retry_at:
+                self.daemon_stopped(display, process, now)
+            if now < self.daemon_retry_at.get(display, 0.0):
+                continue
+            self.daemon_retry_at.pop(display, None)
+            self.daemon_started[display] = now
+            self.xim_servers[display] = start(
+                ["/usr/bin/python3", DAEMON_SCRIPT, display], display, ui_display
+            )
 
         focused, window = read_focus(ui_display)
         if focused in self.games:
@@ -355,7 +446,8 @@ class Bridge:
         self.in_game = focused in self.games or (
             window is not None and window == self.game_window
         )
-        game = self.games.get(self.active_game, {}) if self.in_game else {}
+        self.unlinked = self.in_game and self.game_unlinked(self.active_game)
+        game = self.games.get(self.active_game, {}) if self.in_game and not self.unlinked else {}
         for display in game_displays:
             for input_type in GAME_OPTIONS:
                 self.set_input_state(display, input_type, bool(game.get(input_type)))
@@ -364,6 +456,30 @@ class Bridge:
             self.set_input_state(display, PASTE_GAP_MS, self.paste_gap_ms)
             self.set_input_state(display, WAKE_WAIT_MS, game.get(WAKE_WAIT_MS, DEFAULT_WAKE_WAIT_MS))
             self.set_input_state(display, TOGGLE_KEYS, ",".join(self.toggle_keys))
+
+    def daemon_stopped(self, display, process, now):
+        """Note an input server that stopped by itself, and when to start it again."""
+        quick = now - self.daemon_started.get(display, now) < DAEMON_QUICK_STOP_SECONDS
+        failures = self.daemon_failures.get(display, 0) + 1 if quick else 0
+        self.daemon_failures[display] = failures
+        delay = min(DAEMON_RETRY_MAX_SECONDS, 2 ** failures) if failures else 0
+        self.daemon_retry_at[display] = now + delay
+        log.warning(
+            "input server on %s stopped (exit %s, %s), starting again in %ss",
+            display, process.poll(), daemon_exit_reason(display), delay,
+        )
+
+    def game_unlinked(self, app_id):
+        """Whether the game runs, and none of its programs has the launch option.
+        With no program found, as for a moment while it starts, it counts as linked."""
+        checked_app, when, unlinked = self.link_checked
+        now = time.monotonic()
+        if checked_app == app_id and now - when < LINK_CHECK_SECONDS:
+            return unlinked
+        programs = [process for process in list_game_processes() if process["app_id"] == app_id]
+        unlinked = bool(programs) and not any(process["has_xim_option"] for process in programs)
+        self.link_checked = (app_id, now, unlinked)
+        return unlinked
 
     def set_input_state(self, display, input_type, active):
         """Tell a daemon whether the focused game uses one kind of input, or a value
@@ -493,7 +609,8 @@ def steam_keyboard_path():
 def keyboard_mode():
     """Whether the game in focus uses the bridge, which then composes Hangul from the
     letters the Steam keyboard types, and whether Hangul mode is on."""
-    game = bridge.games.get(bridge.active_game, {}) if bridge.in_game and not bridge.paused else {}
+    linked = bridge.in_game and not bridge.unlinked and not bridge.paused
+    game = bridge.games.get(bridge.active_game, {}) if linked else {}
     return {
         "active": bool(game.get(PHYSICAL)),
         "hangul": hangul_mode_on(),
@@ -505,12 +622,15 @@ def keyboard_mode():
 def current_state():
     return {
         "games": bridge.games,
-        "active": bridge.in_game,
+        "active": bridge.in_game and not bridge.unlinked,
+        "unlinked_game": bridge.active_game if bridge.in_game and bridge.unlinked else None,
         "xim_running": any(is_running(p) for p in bridge.xim_servers.values()),
         "steam_keyboard_path": steam_keyboard_path(),
         "processes": list_game_processes(),
         "keep_keyboard_on_enter": bridge.keep_keyboard_on_enter,
         "keyboard_opacity": bridge.keyboard_opacity,
+        "opacity_off_on_desktop": bridge.opacity_off_on_desktop,
+        "desktop_mode": steam_in_desktop_mode(),
         "backspace_hold_ms": bridge.backspace_hold_ms,
         "paste_gap_ms": bridge.paste_gap_ms,
         "toggle_keys": bridge.toggle_keys,
@@ -649,6 +769,11 @@ class Plugin:
 
     async def set_backspace_hold_ms(self, milliseconds):
         bridge.backspace_hold_ms = clamp_backspace_hold(milliseconds)
+        bridge.save()
+        return await asyncio.to_thread(current_state)
+
+    async def set_opacity_off_on_desktop(self, enabled):
+        bridge.opacity_off_on_desktop = bool(enabled)
         bridge.save()
         return await asyncio.to_thread(current_state)
 
