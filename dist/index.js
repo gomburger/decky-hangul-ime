@@ -328,19 +328,60 @@ const SEND_METHOD_CHOICES = [
     },
 ];
 
-// When the picker was opened and closed: the panel built anew after it gives focus
-// back to the button. Kept here, as the panel itself is taken down meanwhile.
+// When the picker was opened, and how far the panel was scrolled then: the panel
+// built anew after it goes back there and gives focus back to the button. Kept
+// here, as the panel itself is taken down meanwhile.
 let pickerOpenedAt = 0;
-let pickerClosedAt = 0;
-const PICKER_RETURN_MS = 5000;
-const FOCUS_SETTLE_MS = [60, 300];
+let pickerScrollTop = null;
+const PICKER_RETURN_MS = 60000;
+// Steam puts focus somewhere 1 to 4 ms after the page shows; if that is not the
+// button, it comes back to it at 20 ms.
+const FOCUS_SETTLE_MS = 20;
 // The press that closed the picker reaches the menu once more as it shows again,
 // within 90ms; it would open the picker again. No hand presses that soon.
 let pickerReturnedAt = 0;
 const PICKER_ECHO_MS = 150;
+// When the panel last showed or was built. B that closes the picker also reaches
+// the panel again (32 to 43 ms after it shows, measured in Screen Recorder), and
+// Decky would take it as Back to the plugin list.
+let panelShownAt = 0;
+const BACK_ECHO_MS = 150;
+
+// The A that opens the picker can reach it once more as it appears and press the
+// choice it focused first, closing it at once. As in AdGuard VPN 0.8.2 and Screen
+// Recorder 0.10.2: an A within 150 ms of the picker appearing is dropped, caught
+// first in the page it is drawn in. B and touch are left alone; the B that closes
+// it is handled on the panel's side.
+let pickerShownAt = 0;
+const OPEN_ECHO_MS = 150;
+const OPEN_GUARD_MS = 1500;
+
+function markPickerShown() {
+    pickerShownAt = Date.now();
+}
+
+function guardOpenEcho() {
+    let page;
+    try {
+        page = DFL.findSP?.()?.document;
+    }
+    catch {
+        page = null;
+    }
+    if (!page) return;
+    pickerShownAt = Date.now();
+    const dropEcho = (event) => {
+        if (Date.now() - pickerShownAt >= OPEN_ECHO_MS) return;
+        event.stopPropagation();
+        event.preventDefault();
+    };
+    page.addEventListener("vgp_onok", dropEcho, true);
+    // Long enough for the picker to appear; the check above does the timing.
+    setTimeout(() => page.removeEventListener("vgp_onok", dropEcho, true), OPEN_GUARD_MS);
+}
 
 function pickerJustClosed() {
-    return pickerOpenedAt > 0 && (pickerClosedAt === 0 || Date.now() - pickerClosedAt < PICKER_RETURN_MS);
+    return pickerOpenedAt > 0 && Date.now() - pickerOpenedAt < PICKER_RETURN_MS;
 }
 
 // Give focus to what is in an element the way the controller would, through the
@@ -362,14 +403,31 @@ function takeSteamFocus(element) {
     target.focus?.();
 }
 
+// Steam scrolls to a row only when focus moves to it; when Steam has already put
+// focus back on this row by place, TakeFocus changes nothing and the row can stay
+// out of sight.
+function showInPanel(element) {
+    const scroller = findScroller(element);
+    if (!element || !scroller) return;
+    const box = element.getBoundingClientRect();
+    const view = scroller.getBoundingClientRect();
+    if (box.top >= view.top && box.bottom <= view.bottom) return;
+    element.scrollIntoView({ block: "center", behavior: "auto" });
+}
+
 // Once the page shows, Steam picks where focus goes; this comes just after it.
 function focusOnceShown(element) {
     const page = element?.ownerDocument;
     if (!page) return undefined;
-    const timers = [];
+    let timer = null;
     const focusSoon = () => {
         pickerReturnedAt = Date.now();
-        for (const delay of FOCUS_SETTLE_MS) timers.push(setTimeout(() => takeSteamFocus(element), delay));
+        panelShownAt = Date.now();
+        // TakeFocus on the node that has focus already changes nothing.
+        timer = setTimeout(() => {
+            takeSteamFocus(element);
+            showInPanel(element);
+        }, FOCUS_SETTLE_MS);
     };
     const onShown = () => {
         if (page.visibilityState !== "visible") return;
@@ -380,7 +438,7 @@ function focusOnceShown(element) {
     else page.addEventListener("visibilitychange", onShown);
     return () => {
         page.removeEventListener("visibilitychange", onShown);
-        timers.forEach(clearTimeout);
+        clearTimeout(timer);
     };
 }
 
@@ -407,12 +465,17 @@ function removePickerStyle() {
 const PICKER_BUTTON = { padding: "8px 12px", minWidth: 0, width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" };
 
 // Each way with what it does, the one in use marked and focused first.
-function SendMethodPicker({ closeModal, selected, onPick, onClose }) {
-    const close = () => {
-        onClose();
-        closeModal();
-    };
+function SendMethodPicker({ closeModal, selected, onPick }) {
+    SP_REACT.useEffect(markPickerShown, []);
+    // A second check inside the picker, from when it is drawn: an early press that
+    // gets past the page-level guard still picks nothing.
+    const drawnAt = SP_REACT.useRef(0);
+    SP_REACT.useLayoutEffect(() => {
+        drawnAt.current = Date.now();
+    }, []);
+    const close = () => closeModal();
     const pick = (choice) => {
+        if (Date.now() - drawnAt.current < OPEN_ECHO_MS) return;
         close();
         if (choice !== selected) onPick(choice);
     };
@@ -565,11 +628,11 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
         if (Date.now() - pickerReturnedAt < PICKER_ECHO_MS) return;
         stylePicker();
         pickerOpenedAt = Date.now();
-        pickerClosedAt = 0;
+        pickerScrollTop = findScroller(pickerButton.current)?.scrollTop ?? null;
+        guardOpenEcho();
         DFL.showModal(h(SendMethodPicker, {
             selected: method,
             onPick: (choice) => onMethodChange(choice),
-            onClose: () => { pickerClosedAt = Date.now(); },
         }));
     };
     return h(SP_REACT.Fragment, null,
@@ -586,7 +649,7 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
                     onClick: openPicker,
                 },
                     h("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 } }, chosen.label),
-                    h("span", { style: { flexShrink: 0, opacity: 0.7 } }, "▾"))))),
+                    h("span", { style: { flexShrink: 0, opacity: 0.7 } }, h(Chevron, { up: false })))))),
         // What the chosen way does, and when it suits.
         h(SP_REACT.Fragment, { key: `about-${method}` }, noteRow(...chosen.about)),
         // Each group has a place of its own: spread side by side, the steppers' row
@@ -635,6 +698,13 @@ function SteamKeyboardLight({ path }) {
     return h(StatusLight, { label: "Steam 가상 키보드", color: path === "letters" ? STATUS_ON_COLOR : STATUS_IDLE_COLOR });
 }
 
+// An arrow for a button that folds rows away: up while they show.
+function Chevron({ up }) {
+    return h("svg", { viewBox: "0 0 24 24", width: 18, height: 18, style: { display: "block" } },
+        h("path", { d: up ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6", fill: "none", stroke: "currentColor",
+            strokeWidth: 2.5, strokeLinecap: "round", strokeLinejoin: "round" }));
+}
+
 function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
     const [open, setOpen] = SP_REACT.useState(readAdvancedOpen);
     const processes = state?.processes ?? [];
@@ -646,7 +716,8 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
         h(DFL.PanelSection, null,
             h(DFL.PanelSectionRow, null,
                 h(DFL.ButtonItem, { layout: "below", bottomSeparator: open ? "none" : "standard", onClick: onToggle },
-                    `고급 ${open ? "▲" : "▼"}`))));
+                    h("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" } },
+                        "고급", h(Chevron, { up: open }))))));
     if (!open) return toggle;
     return [
         toggle,
@@ -665,8 +736,8 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
                             value: Boolean(state?.paused),
                             onChange: onPausedChange,
                         }))))))),
-        h(ToggleKeySection, { key: "toggleKeys", state, onToggleKeyChange }),
         h("div", { key: "localeOption", style: SECTION_PULLED_UP }, h(LocaleOptionSection)),
+        h(ToggleKeySection, { key: "toggleKeys", state, onToggleKeyChange }),
         h("div", { key: "processes", style: SECTION_PULLED_UP }, h(DFL.PanelSection, { title: `현재 프로세스 (${processes.length})` },
             processes.length === 0
                 ? h(DFL.PanelSectionRow, null,
@@ -677,6 +748,61 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
                     value: processStatus(process, state),
                 })))),
     ];
+}
+
+// The scrolling box around the panel: the Quick Access tab's, shared with Decky.
+function findScroller(element) {
+    const view = element?.ownerDocument?.defaultView;
+    for (let node = element?.parentElement; node && view; node = node.parentElement) {
+        const overflow = view.getComputedStyle(node).overflowY;
+        if ((overflow === "auto" || overflow === "scroll") && node.scrollHeight > node.clientHeight) return node;
+    }
+    return null;
+}
+
+// Focus on the 이 게임에서 사용 row shows the top of the panel, with the game's name
+// and status above it. The row scrolls by itself: Steam's own scroll to a focused
+// row would cut a smooth scroll of ours short, or jump past it.
+let useRowElement = null;
+// Rows at the top of the panel: with focus on one of them, the panel shows its top.
+const TOP_ROW_ATTR = "data-hangul-ime-top";
+
+function TopRow(child) {
+    return h("div", { [TOP_ROW_ATTR]: "", ref: (element) => { useRowElement = element; } },
+        h(DFL.Focusable, {
+            "flow-children": "column",
+            scrollIntoViewWhenChildFocused: "force",
+            fnScrollIntoViewHandler: () => {
+                findScroller(useRowElement)?.scrollTo({ top: 0, behavior: "smooth" });
+                return true;
+            },
+        }, child));
+}
+
+// Decky's plugin list and a plugin's page share the Quick Access tab's scroller, so
+// the page opened as far down as the list had been scrolled to reach it. Back to
+// the top as it opens, unless Steam has put focus on a row further down. Once is
+// enough: the panel is drawn in full from its last state, and nothing scrolled it
+// again afterwards (measured 2026-11-19, four opens).
+let panelTop = null;
+
+function resetPanelScroll() {
+    const timer = setTimeout(() => {
+        const focused = panelTop?.querySelector(".gpfocus");
+        if (focused && !focused.closest(`[${TOP_ROW_ATTR}]`)) return;
+        const scroller = findScroller(panelTop);
+        if (scroller) scroller.scrollTop = 0;
+    }, 0);
+    return () => clearTimeout(timer);
+}
+
+// B that closed the picker, echoed to the panel as it shows: dropped, the way a
+// Focusable that handles B would. Caught on a plain element: one more navigation
+// node around the panel would change where Steam puts focus back.
+function dropEchoedBack(event) {
+    if (Date.now() - panelShownAt >= BACK_ECHO_MS) return;
+    event.stopPropagation();
+    event.preventDefault();
 }
 
 // The panel as last seen. The Quick Access menu builds the panel anew each time it
@@ -708,6 +834,36 @@ function App() {
         refresh();
         const timer = setInterval(refresh, 2000);
         return () => { active = false; clearInterval(timer); };
+    }, []);
+
+    // Note when the panel is built or shows again, and drop B echoed to it then.
+    SP_REACT.useEffect(() => {
+        panelShownAt = Date.now();
+        const panel = panelTop;
+        const page = panel?.ownerDocument;
+        if (!page) return undefined;
+        const onVisibility = () => {
+            if (page.visibilityState === "visible") panelShownAt = Date.now();
+        };
+        page.addEventListener("visibilitychange", onVisibility);
+        panel.addEventListener("vgp_oncancel", dropEchoedBack);
+        return () => {
+            page.removeEventListener("visibilitychange", onVisibility);
+            panel.removeEventListener("vgp_oncancel", dropEchoedBack);
+        };
+    }, []);
+
+    // Built anew after the picker: back to where the panel was scrolled, before it
+    // is drawn; the button takes focus back by itself. Opened anew: to the top.
+    // Read as the panel is first drawn, before the button's effect clears it.
+    const [backFromPicker] = SP_REACT.useState(pickerJustClosed);
+    SP_REACT.useLayoutEffect(() => {
+        const scroller = findScroller(panelTop);
+        if (backFromPicker && scroller && pickerScrollTop !== null) scroller.scrollTop = pickerScrollTop;
+    }, []);
+    SP_REACT.useEffect(() => {
+        pickerScrollTop = null;
+        return backFromPicker ? undefined : resetPanelScroll();
     }, []);
 
     const onEnglishOnCloseChange = async (enabled) => {
@@ -877,7 +1033,7 @@ function App() {
         }
     };
 
-    return h(SP_REACT.Fragment, null,
+    return h("div", { ref: (element) => { panelTop = element; } },
         h(DFL.PanelSection, { title: app?.display_name || "한글 입력" },
             unlinked
                 ? h(DFL.PanelSectionRow, null,
@@ -888,10 +1044,11 @@ function App() {
                     h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: "#8b929a" } },
                         statusText(state, isEnabled, app))),
             unlinked && h(DFL.PanelSectionRow, null,
-                h(DFL.ButtonItem, { layout: "below", onClick: onRestoreLaunchOption }, "실행 옵션 복구")),
+                h("div", { [TOP_ROW_ATTR]: "" },
+                    h(DFL.ButtonItem, { layout: "below", onClick: onRestoreLaunchOption }, "실행 옵션 복구"))),
             restartNotice && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, restartNotice)),
             message && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, message)),
-            h(DFL.PanelSectionRow, null,
+            h(DFL.PanelSectionRow, null, TopRow(
                 h(DFL.Field, {
                     label: h("span", { style: { whiteSpace: "nowrap" } }, "이 게임에서 사용"),
                     bottomSeparator: isEnabled ? "none" : "standard",
@@ -902,7 +1059,7 @@ function App() {
                             value: isEnabled,
                             disabled: !app,
                             onChange: onUseToggle,
-                        }))))),
+                        })))))),
             isEnabled && h(ToggleRow, {
                 label: labelWithNote("키보드 닫으면 영문으로", "조작키가 한글로 바뀌지 않게 해요.", "다시 열면 이전 한/영 상태로 돌아가요."),
                 value: game?.english_on_close ?? true,
@@ -958,6 +1115,8 @@ function App() {
                 label: labelWithNote("데스크톱 모드에서 끄기", "키보드 불투명도를 게임 모드에만 적용해요."),
                 value: Boolean(state?.opacity_off_on_desktop),
                 onChange: onOpacityOffOnDesktopChange,
+                // The line above the 고급 button, as the slider draws when this is hidden.
+                separator: true,
             }))),
         h(AdvancedSections, {
             state,
@@ -1655,7 +1814,9 @@ var index = DFL.definePlugin(() => {
     reportAccount();
     return {
         name: manifest.name,
-        titleView: h("div", { className: DFL.staticClasses.Title }, "한글 IME"),
+        // Same element Decky draws when there is no titleView, so the title sits next to
+        // the back button without a second Title class (its padding and shadow) inside.
+        titleView: h("div", { style: { flex: 0.9 } }, "한글 IME"),
         content: h(App, null),
         icon: h("span", { style: { fontWeight: "bold" } }, "한"),
         onDismount() {
