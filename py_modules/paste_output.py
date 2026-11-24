@@ -46,6 +46,10 @@ EVENT_SIZE = 192
 DEFAULT_GAP_SECONDS = 0.035
 # How long to wait for the pressed V to come back through XIM before going on.
 RETURN_TIMEOUT_SECONDS = 0.3
+# How long pasted text stays on the clipboard once the pastes are over: time for a
+# game at a low frame rate to read it, then it is gone, so typed text is not left
+# there for anything else to read.
+CLIPBOARD_KEEP_SECONDS = 2.0
 # While the Steam keyboard's key map is in place, how often to look again, and for
 # how long at most before pressing anyway.
 KEYS_READY_POLL_SECONDS = 0.01
@@ -73,6 +77,12 @@ class Paster:
         x.XCreateSimpleWindow.restype = ulong
         x.XCreateSimpleWindow.argtypes = [void, ulong] + [ctypes.c_int] * 2 + [ctypes.c_uint] * 3 + [ulong] * 2
         x.XSetSelectionOwner.argtypes = [void, ulong, ulong, ulong]
+        x.XConvertSelection.argtypes = [void, ulong, ulong, ulong, ulong, ulong]
+        x.XGetWindowProperty.argtypes = [
+            void, ulong, ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int, ulong, ctypes.POINTER(ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ulong), ctypes.POINTER(ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+        ]
         x.XChangeProperty.argtypes = [void, ulong, ulong, ulong, ctypes.c_int, ctypes.c_int, void, ctypes.c_int]
         x.XSendEvent.argtypes = [void, ulong, ctypes.c_int, ctypes.c_long, void]
         x.XNextEvent.argtypes = [void, void]
@@ -96,6 +106,8 @@ class Paster:
             raise OSError(f"cannot open display {display_name}")
         self._clipboard = self._atom("CLIPBOARD")
         self._targets = self._atom("TARGETS")
+        self._utf8 = self._atom("UTF8_STRING")
+        self._check_property = self._atom("HANGUL_BRIDGE_CLIPBOARD")
         self._text_types = {
             self._atom("UTF8_STRING"), self._atom("TEXT"), self._atom("text/plain;charset=utf-8"), XA_STRING,
         }
@@ -103,6 +115,7 @@ class Paster:
             self._display, x.XDefaultRootWindow(self._display), 0, 0, 1, 1, 0, 0, 0
         )
         self._text = b""
+        self._clearing = None  # the pasted text, while the clipboard is read to clear it
         self.control = x.XKeysymToKeycode(self._display, CONTROL_L) or CONTROL_KEYCODE
         self.real_v = x.XKeysymToKeycode(self._display, LETTER_V) or REAL_V_KEYCODE
         self.v = self._spare_keycode()
@@ -186,6 +199,39 @@ class Paster:
         self._x.XSetSelectionOwner(self._display, self._clipboard, self._window, 0)
         self._x.XFlush(self._display)
 
+    def clear_clipboard(self):
+        """Empty the clipboard if it still holds the pasted text. gamescope copies
+        the text and owns the clipboard from then on, so giving it up would leave
+        the text there: an empty text is offered instead, which gamescope copies
+        in turn. What is there is read first, to leave alone anything copied since."""
+        if not self._text:
+            return
+        self._clearing = self._text
+        self._x.XConvertSelection(
+            self._display, self._clipboard, self._utf8, self._check_property, self._window, 0
+        )
+        self._x.XFlush(self._display)
+
+    def _clipboard_read(self, raw):
+        pasted, self._clearing = self._clearing, None
+        if pasted is None or struct.unpack_from("<Q", raw, 56)[0] == 0:
+            return
+        kind, size, count, after = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong()
+        data = ctypes.POINTER(ctypes.c_ubyte)()
+        x = self._x
+        if x.XGetWindowProperty(
+            self._display, self._window, self._check_property, 0, len(pasted) // 4 + 2, 1, 0,
+            ctypes.byref(kind), ctypes.byref(size), ctypes.byref(count), ctypes.byref(after), ctypes.byref(data),
+        ) != 0:
+            return
+        try:
+            there = bytes(data[:count.value]) if data else b""
+        finally:
+            if data:
+                x.XFree(data)
+        if there == pasted and not after.value and self._text == pasted:
+            self.take_clipboard("")
+
     def key(self, keycode, pressed):
         self._t.XTestFakeKeyEvent(self._display, keycode, 1 if pressed else 0, 0)
         self._x.XFlush(self._display)
@@ -199,8 +245,11 @@ class Paster:
         event = ctypes.create_string_buffer(EVENT_SIZE)
         while x.XPending(self._display):
             x.XNextEvent(self._display, event)
-            if struct.unpack_from("<i", event.raw, 0)[0] == SELECTION_REQUEST:
+            kind = struct.unpack_from("<i", event.raw, 0)[0]
+            if kind == SELECTION_REQUEST:
                 self._answer(event.raw)
+            elif kind == SELECTION_NOTIFY:
+                self._clipboard_read(event.raw)
         x.XFlush(self._display)
 
     def _answer(self, raw):
@@ -233,8 +282,8 @@ class PasteOutput:
 
     server      has send_key_back(context, serial, event)
     timers      has call_later(seconds, function), returning a timer with cancel()
-    paster      has take_clipboard(text), key(keycode, pressed), keys_ready(), control
-                and v
+    paster      has take_clipboard(text), clear_clipboard(), key(keycode, pressed),
+                keys_ready(), control and v
     forwarding  tells whether keys are being forwarded here right now
     """
 
@@ -258,6 +307,9 @@ class PasteOutput:
         self.map_changed = False  # another key map was in place while Ctrl was down
         self.restarts = 0
         self.wait_timer = None
+        self.on_clipboard = False  # pasted text is on the clipboard
+        self.clipboard_keep = CLIPBOARD_KEEP_SECONDS  # None keeps it there
+        self.clear_timer = None
 
     @property
     def idle(self):
@@ -322,10 +374,21 @@ class PasteOutput:
                 continue
             self.busy = True
             self.v = self.paster.real_v if kind == "text with real v" else self.paster.v
+            if self.clear_timer:
+                self.clear_timer.cancel()
+                self.clear_timer = None
             self.paster.take_clipboard(item)
+            self.on_clipboard = True
             self.timers.call_later(self.gap, self._paste)
         if self.idle:
+            if self.on_clipboard and not self.clear_timer and self.clipboard_keep is not None:
+                self.clear_timer = self.timers.call_later(self.clipboard_keep, self._clear_clipboard)
             self.on_idle()
+
+    def _clear_clipboard(self):
+        self.clear_timer = None
+        self.on_clipboard = False
+        self.paster.clear_clipboard()
 
     def _key_spaced(self):
         self.busy = False

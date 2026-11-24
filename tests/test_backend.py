@@ -75,6 +75,7 @@ class BackendTest(unittest.TestCase):
             daemon.physical_file, daemon.virtual_file, daemon.direct_file, daemon.erase_text_file,
             daemon.backspace_hold_file, daemon.paste_file, daemon.paste_gap_file, daemon.toggle_keys_file,
             daemon.wake_wait_file, daemon.ime_wake_file, daemon.paste_batch_file, daemon.batch_row_missing_file,
+            daemon.enter_commit_file,
         }
         self.assertEqual(read, written)
         self.assertEqual(self.backend.input_state_path(":1", self.backend.MODE), daemon.mode_file)
@@ -236,6 +237,89 @@ class BackendTest(unittest.TestCase):
         state = run(plugin.get_state(plugin))
         self.assertEqual(state["unlinked_game"], "3")
         self.assertFalse(state["active"])
+
+    def test_a_game_started_before_the_option_was_added_needs_a_restart(self):
+        plugin, backend, run = self.backend.Plugin, self.backend, asyncio.run
+        backend.seconds_since_boot = lambda: 100.0
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": False, "started": 50.0}]
+        backend.list_game_processes = lambda: programs
+        state = run(plugin.set_game_enabled(plugin, "3", True))
+        self.assertEqual(state["restart_games"], {"3": "added"})
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {"3": "added"})  # still, on reopening
+        # Started again after it, still without the option: the option was lost.
+        programs[0]["started"] = 150.0
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+        # Started again with it.
+        programs[0].update(started=50.0, has_xim_option=True)
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+
+    def test_restoring_the_option_asks_for_a_restart_too(self):
+        plugin, backend, run = self.backend.Plugin, self.backend, asyncio.run
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": False, "started": 50.0}]
+        backend.list_game_processes = lambda: programs
+        backend.seconds_since_boot = lambda: 10.0  # registered before the game started
+        self.assertEqual(run(plugin.set_game_enabled(plugin, "3", True))["restart_games"], {})
+        backend.seconds_since_boot = lambda: 100.0
+        self.assertEqual(run(plugin.note_launch_option_added(plugin, 3))["restart_games"], {"3": "added"})
+
+    def test_a_game_running_with_the_option_needs_a_restart_once_it_is_off(self):
+        plugin, backend, run = self.backend.Plugin, self.backend, asyncio.run
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": True, "started": 50.0}]
+        backend.list_game_processes = lambda: programs
+        backend.seconds_since_boot = lambda: 10.0
+        run(plugin.set_game_enabled(plugin, "3", True))
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+        backend.seconds_since_boot = lambda: 100.0
+        self.assertEqual(run(plugin.set_game_enabled(plugin, "3", False))["restart_games"], {"3": "removed"})
+        programs[0].update(started=150.0, has_xim_option=False)  # started again without it
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+
+    def test_a_game_older_than_the_input_server_needs_a_restart(self):
+        plugin, backend, bridge, run = self.backend.Plugin, self.backend, self.backend.bridge, asyncio.run
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": True, "started": 50.0}]
+        backend.list_game_processes = lambda: programs
+        backend.seconds_since_boot = lambda: 10.0
+        run(plugin.set_game_enabled(plugin, "3", True))
+        bridge.xim_servers, bridge.server_started_at = {":1": None}, {":1": 20.0}
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+        bridge.server_started_at[":1"] = 100.0  # started again after a pause
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {"3": "server"})
+        # Left alone until then: no Hangul from the Steam keyboard's letters.
+        bridge.in_game, bridge.active_game, bridge.link_checked = True, "3", (None, 0.0, False)
+        bridge.unlinked = bridge.game_unlinked("3")
+        self.assertTrue(bridge.unlinked)
+        self.assertFalse(run(plugin.get_keyboard_mode(plugin))["active"])
+        bridge.games["3"]["paste"] = True  # pasting still works
+        bridge.link_checked = (None, 0.0, False)
+        self.assertFalse(bridge.game_unlinked("3"))
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+        bridge.games["3"]["paste"] = False
+        bridge.xim_servers = {}  # paused: nothing to say yet
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+        bridge.xim_servers = {":1": None}
+        programs[0]["started"] = 150.0  # the game started again
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {})
+
+    def test_no_pausing_while_a_connected_game_runs(self):
+        plugin, backend, bridge, run = self.backend.Plugin, self.backend, self.backend.bridge, asyncio.run
+        programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": True, "started": 50.0}]
+        backend.list_game_processes = lambda: programs
+        with self.assertRaises(ValueError):
+            run(plugin.set_paused(plugin, True))
+        self.assertFalse(bridge.paused)
+        programs[0]["has_xim_option"] = False  # a game the input server never reached
+        self.assertTrue(run(plugin.set_paused(plugin, True))["paused"])
+        programs[0]["has_xim_option"] = True  # running through the pause
+        backend.seconds_since_boot = lambda: 100.0
+        run(plugin.set_game_enabled(plugin, "3", True))
+        bridge.option_changed_at["3"] = 10.0
+        self.assertFalse(run(plugin.set_paused(plugin, False))["paused"])
+        bridge.xim_servers, bridge.server_started_at = {":1": None}, {":1": 101.0}
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {"3": "resumed"})
+        bridge.link_checked = (None, 0.0, False)
+        self.assertTrue(bridge.game_unlinked("3"))  # Steam keyboard left alone till then
+        bridge.server_started_at[":1"] = 200.0  # started again much later, not for the pause
+        self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {"3": "server"})
 
     def test_link_is_looked_at_again_after_a_while(self):
         bridge = self.backend.bridge

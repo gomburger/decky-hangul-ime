@@ -14,7 +14,8 @@ ERASE_TEXT = "erase_text"  # erasing it with Backspace characters rather than ke
 PASTE = "paste"  # pasting finished text with Ctrl+V, for games the IME cannot reach
 IME_WAKE = "ime_wake"  # pressing a key after Enter, so the game turns its IME back on
 PASTE_BATCH = "paste_batch"  # holding pasted text on an input line until Enter
-GAME_OPTIONS = (VIRTUAL, PHYSICAL, DIRECT, ERASE_TEXT, PASTE, IME_WAKE, PASTE_BATCH)
+ENTER_COMMIT = "enter_commit"  # pressing a key between the last syllable and Enter
+GAME_OPTIONS = (VIRTUAL, PHYSICAL, DIRECT, ERASE_TEXT, PASTE, IME_WAKE, PASTE_BATCH, ENTER_COMMIT)
 # Written by the plugin: how long direct mode holds Backspace, in milliseconds.
 BACKSPACE_HOLD_MS = "backspace_hold_ms"
 # Written by the plugin: each wait of a paste, in milliseconds.

@@ -67,6 +67,11 @@ class FakePaster:
     def take_clipboard(self, text):
         self.log.append((round(self.clock.now, 3), "clipboard", text))
 
+    cleared = ()
+
+    def clear_clipboard(self):
+        self.cleared = self.cleared + (round(self.clock.now, 3),)
+
     def key(self, keycode, pressed):
         self.log.append((round(self.clock.now, 3), "press" if pressed else "release", keycode))
         if keycode == self.real_v:
@@ -93,6 +98,7 @@ class PasteOutputTest(unittest.TestCase):
         self.paster = FakePaster(self.clock, self.log)
         self.output = paste_output.PasteOutput(FakeServer(self.log), self.clock, self.paster, lambda: forwarding)
         self.output.gap = GAP
+        self.output.clipboard_keep = None  # timings below end with the paste
         if forwarding:
             # The game hands each V back through XIM as soon as it is pressed.
             self.paster.game = lambda keycode, pressed: self.output.take_own_key(keycode, pressed)
@@ -116,6 +122,33 @@ class PasteOutputTest(unittest.TestCase):
 
     def presses(self):
         return [entry[2] for entry in self.log if entry[1] == "press"]
+
+    def test_the_clipboard_is_cleared_a_while_after_the_last_paste(self):
+        self.make()
+        self.output.clipboard_keep = 2.0
+        self.output.commit("가")
+        self.clock.run()
+        self.assertEqual(self.paster.cleared, (2.175,))  # 2 s after the paste is over
+        self.output.commit("나")
+        self.output.commit("다")
+        self.clock.run()
+        self.assertEqual(len(self.paster.cleared), 2)  # once for both
+
+    def test_a_paste_on_its_way_keeps_the_clipboard(self):
+        self.make()
+        self.output.clipboard_keep = 2.0
+        self.output.commit("가")
+        while self.output.busy:
+            timer = min((t for t in self.clock.timers if t.function), key=lambda t: t.when)
+            self.clock.timers.remove(timer)
+            self.clock.now = timer.when
+            timer.function()
+        self.clock.now += 1.0
+        self.output.commit("나")  # before the 2 s are up
+        self.clock.run()
+        second = [e[0] for e in self.log if e[1:] == ("clipboard", "나")][0]
+        self.assertEqual(len(self.paster.cleared), 1)  # only after the second
+        self.assertGreater(self.paster.cleared[0], second + 2.0)
 
     def test_held_text_is_pasted_with_the_real_v(self):
         self.make()
@@ -751,6 +784,41 @@ class DaemonPasteTest(unittest.TestCase):
         self.enter()
         self.type_jamo([19])
         self.assertEqual(len(self.wake_presses()), 1)
+
+    def test_enter_after_a_syllable_waits_for_the_wake_key(self):
+        daemon = self.daemon
+        daemon.ime_wake = False
+        daemon.enter_commit = True
+        enter = 28 + xim_daemon.EVDEV_TO_X11_KEYCODE
+        self.type_jamo([19, 37])  # 가, still composing
+        self.clock.run()
+        self.press(28, True, evdev=True)
+        self.press(28, False, evdev=True)
+        self.clock.run()
+        order = [e for e in self.log if e[0] == "ime commit" or e[1:] == ("press", WAKE) or e == ("back", enter)]
+        self.assertEqual(order, [("ime commit", "가"), (order[1][0], "press", WAKE), ("back", enter), ("back", enter)])
+        self.assertFalse(daemon.game_output.holding)
+
+    def test_enter_with_nothing_composed_goes_at_once(self):
+        daemon = self.daemon
+        daemon.enter_commit = True
+        self.enter()
+        self.assertFalse(self.wake_presses())
+
+    def test_enter_commit_is_off_unless_turned_on(self):
+        self.daemon.ime_wake = False
+        self.type_jamo([19, 37])
+        self.enter()
+        self.assertFalse(self.wake_presses())
+
+    def test_direct_mode_does_not_press_before_enter(self):
+        daemon = self.daemon
+        daemon.ime_wake = False
+        daemon.enter_commit = True
+        daemon._set_direct(True)
+        self.type_jamo([19, 37])
+        self.enter()
+        self.assertFalse(self.wake_presses())
 
     def test_paste_mode_does_not_wake(self):
         daemon = self.daemon

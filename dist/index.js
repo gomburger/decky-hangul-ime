@@ -19,6 +19,7 @@ const setToggleKey = callable("set_toggle_key");
 const setWakeWait = callable("set_wake_wait_ms");
 const setGameSetting = callable("set_game_setting");
 const removeGame = callable("remove_game");
+const noteLaunchOptionAdded = callable("note_launch_option_added");
 const setKeepKeyboard = callable("set_keep_keyboard_on_enter");
 const setOpacity = callable("set_keyboard_opacity");
 const setOpacityOffOnDesktop = callable("set_opacity_off_on_desktop");
@@ -52,7 +53,7 @@ const WAKE_WAIT_MAX_MS = 1000;
 const WAKE_WAIT_DEFAULT_MS = 500;
 const SHORTCUT_APP_TYPE = 1073741824;
 const STATUS_ON_COLOR = "#4caf50";
-const STATUS_OFF_COLOR = "#f44336";
+const STATUS_OFF_COLOR = "#c62828";
 const STATUS_IDLE_COLOR = "#8b929a";
 const STATUS_WARN_COLOR = "#ffc107";
 const ADVANCED_OPEN_KEY = "hangul-ime-advanced-open";
@@ -168,13 +169,21 @@ function registeredGames(state) {
     return Object.keys(state?.games ?? {}).sort();
 }
 
+// Why the running game has to be started again, as the backend says.
+const RESTART_REASONS = {
+    added: "실행 옵션을 추가했어요.",
+    removed: "실행 옵션을 뺐어요.",
+    server: "입력 서버를 다시 시작했어요.",
+    resumed: "일시 중지를 해제했어요.",
+};
+
 function statusText(state, isEnabled, app) {
     if (!app) return "게임을 실행하면 여기서 켤 수 있어요.";
     if (!isEnabled) return "꺼져 있어요.";
     if (state?.paused) return "일시 중지 중이에요.";
     if (state?.active && state?.xim_running) return "한글 입력 동작 중이에요.";
     if (!state?.xim_running) return "입력 서버를 준비하는 중이에요.";
-    return "이 게임으로 돌아오면 한글 조합이 시작돼요.";
+    return "게임 화면으로 돌아가면 한글을 입력할 수 있어요.";
 }
 
 function gameName(appId) {
@@ -190,6 +199,9 @@ function gameName(appId) {
 
 function processStatus(process, state) {
     if (!state?.games?.[process.app_id]) return "토글 꺼짐";
+    // The input server is off: a game started now has to start again once it is on.
+    if (state?.paused) return "일시 중지";
+    if (state?.restart_games?.[process.app_id]) return "재시작 필요";
     return process.has_xim_option ? "적용됨" : "재시작 필요";
 }
 
@@ -547,7 +559,7 @@ function ToggleRow({ label, value, disabled, onChange, separator }) {
 // How the focused game gets the composition. Typing it as text and pasting are
 // toggles that exclude each other; with both off, the IME is used. The settings of
 // each show only while it is on.
-function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, onEraseTextChange, onPasteGapChange, onPasteBatchChange, onImeWakeChange, onWakeWaitChange }) {
+function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, onEraseTextChange, onPasteGapChange, onPasteBatchChange, onImeWakeChange, onWakeWaitChange, onEnterCommitChange }) {
     const method = sendMethod(game);
     const direct = method === "direct";
     const paste = method === "paste";
@@ -590,6 +602,17 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
             onChange: onPasteGapChange,
         }),
         ClosingNote("글자가 빠지면 늘려주세요.", "FPS가 낮은 게임에서는 늘려주세요.", `(기본값 ${PASTE_GAP_DEFAULT_MS}ms, 30FPS 기준)`),
+    ] : [];
+    // Only the IME's text can be taken in the same frame as Enter: typed or pasted
+    // text goes out before it in turn.
+    const imeSettings = method === "ime" ? [
+        h(ToggleRow, {
+            label: labelWithNote("Enter 전 글자 확정", "Enter를 누르면 마지막 글자가 빠지는", "게임에서 켜주세요."),
+            value: Boolean(game?.enter_commit),
+            disabled: !isEnabled,
+            onChange: onEnterCommitChange,
+            separator: true,
+        }),
     ] : [];
     // A paste presses keys of its own, so it needs no waking.
     const imeWake = Boolean(game?.ime_wake);
@@ -654,6 +677,7 @@ function SendMethodRows({ state, game, isEnabled, onMethodChange, onHoldChange, 
         h(SP_REACT.Fragment, { key: `about-${method}` }, noteRow(...chosen.about)),
         // Each group has a place of its own: spread side by side, the steppers' row
         // keys would clash, and React would leave rows behind.
+        h(SP_REACT.Fragment, { key: "imeSettings" }, ...imeSettings),
         h(SP_REACT.Fragment, { key: "directSettings" }, ...directSettings),
         h(SP_REACT.Fragment, { key: "pasteSettings" }, ...pasteSettings),
         h(SP_REACT.Fragment, { key: "wakeSettings" }, ...(paste ? [] : wakeSettings)));
@@ -708,6 +732,11 @@ function Chevron({ up }) {
 function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
     const [open, setOpen] = SP_REACT.useState(readAdvancedOpen);
     const processes = state?.processes ?? [];
+    // Pausing stops the input servers, which a connected game cannot survive: it
+    // can crash, or hang as it quits. Only with no such game running.
+    const gameConnected = processes.some((process) => process.has_xim_option);
+    // A game that ran through the pause lost the input server and has to start again.
+    const resumedInGame = Object.values(state?.restart_games ?? {}).includes("resumed");
     const onToggle = () => {
         saveAdvancedOpen(!open);
         setOpen(!open);
@@ -728,12 +757,14 @@ function AdvancedSections({ state, onPausedChange, onToggleKeyChange }) {
                     h(SteamKeyboardLight, { path: state?.steam_keyboard_path }))),
             h(DFL.PanelSectionRow, null,
                 h(DFL.Field, {
-                    label: labelWithNote("일시 중지", "입력 서버와 포커스 감지를 꺼요.", "다시 켜면 게임을 재시작해 주세요."),
+                    label: labelWithNote("일시 중지", "입력 서버와 포커스 감지를 꺼요.",
+                        resumedInGame ? "해제했으니 게임을 다시 실행해 주세요." : "게임을 끈 상태에서만 켤 수 있어요."),
                     ...VALUE_COLUMN,
                 },
                     columnValue(h("div", { style: { position: "relative", left: "3px" } },
                         h(DFL.Toggle, {
                             value: Boolean(state?.paused),
+                            disabled: !state?.paused && gameConnected,
                             onChange: onPausedChange,
                         }))))))),
         h("div", { key: "localeOption", style: SECTION_PULLED_UP }, h(LocaleOptionSection)),
@@ -817,14 +848,16 @@ function App() {
         setStateHere(next);
     };
     const [message, setMessage] = SP_REACT.useState("");
-    const [restartNotice, setRestartNotice] = SP_REACT.useState("");
     const [opacityDraft, setOpacityDraft] = SP_REACT.useState(null);
     const app = DFL.Router.MainRunningApp;
     const appId = app?.appid ? String(app.appid) : null;
     const game = appId ? state?.games?.[appId] : null;
     const isEnabled = Boolean(game);
-    // Running without the launch option, which the game reads only as it starts.
-    const unlinked = isEnabled && state?.unlinked_game != null && String(state.unlinked_game) === String(appId);
+    // Running without the launch option, which the game reads only as it starts:
+    // added while it ran, it needs a restart; otherwise the option was lost.
+    const restartReason = appId ? state?.restart_games?.[appId] : undefined;
+    const needsRestart = Boolean(restartReason);
+    const unlinked = isEnabled && !needsRestart && state?.unlinked_game != null && String(state.unlinked_game) === String(appId);
 
     SP_REACT.useEffect(() => {
         let active = true;
@@ -917,7 +950,10 @@ function App() {
             setState(await setPaused(paused));
         }
         catch (error) {
-            setMessage(`설정하지 못했어요: ${error?.message ?? error}`);
+            const text = String(error?.message ?? error);
+            setMessage(text.includes("game using the input server")
+                ? "게임을 끈 뒤에 일시 중지할 수 있어요."
+                : `설정하지 못했어요: ${text}`);
         }
     };
 
@@ -1010,7 +1046,7 @@ function App() {
         setMessage("");
         try {
             await applyLaunchOptions(app, true);
-            setRestartNotice("실행 옵션을 복구했어요. 게임을 다시 켜야 적용돼요.");
+            setState(await noteLaunchOptionAdded(appId));
         }
         catch (error) {
             setMessage(`복구하지 못했어요: ${error?.message ?? error}`);
@@ -1022,11 +1058,6 @@ function App() {
         try {
             if (enabled !== isEnabled) await applyLaunchOptions(app, enabled);
             setState(await setGameEnabled(appId, enabled));
-            if (enabled !== isEnabled) {
-                setRestartNotice(enabled
-                    ? "실행 옵션을 추가했어요. 게임을 다시 켜야 적용돼요."
-                    : "실행 옵션을 뺐어요. 게임을 다시 켜야 적용돼요.");
-            }
         }
         catch (error) {
             setMessage(`설정하지 못했어요: ${error?.message ?? error}`);
@@ -1035,7 +1066,12 @@ function App() {
 
     return h("div", { ref: (element) => { panelTop = element; } },
         h(DFL.PanelSection, { title: app?.display_name || "한글 입력" },
-            unlinked
+            needsRestart
+                ? h(DFL.PanelSectionRow, null,
+                    h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: STATUS_WARN_COLOR } },
+                        h("div", null, RESTART_REASONS[restartReason] ?? RESTART_REASONS.server),
+                        h("div", null, "게임을 다시 실행해 주세요.")))
+                : unlinked
                 ? h(DFL.PanelSectionRow, null,
                     h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: STATUS_WARN_COLOR } },
                         h("div", null, "실행 옵션이 적용되지 않았어요."),
@@ -1046,7 +1082,6 @@ function App() {
             unlinked && h(DFL.PanelSectionRow, null,
                 h("div", { [TOP_ROW_ATTR]: "" },
                     h(DFL.ButtonItem, { layout: "below", onClick: onRestoreLaunchOption }, "실행 옵션 복구"))),
-            restartNotice && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, restartNotice)),
             message && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, message)),
             h(DFL.PanelSectionRow, null, TopRow(
                 h(DFL.Field, {
@@ -1085,6 +1120,7 @@ function App() {
                     onPasteGapChange,
                     onPasteBatchChange: onOptionToggle("paste_batch"),
                     onImeWakeChange: onOptionToggle("ime_wake"),
+                    onEnterCommitChange: onOptionToggle("enter_commit"),
                     onWakeWaitChange,
                 } })),
         h("div", { style: SECTION_PULLED_UP }, h(DFL.PanelSection, { title: "편의 기능" },

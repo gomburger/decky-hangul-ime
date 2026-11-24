@@ -34,6 +34,8 @@ USER_HOME = os.environ.get("DECKY_USER_HOME", "/home/deck")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 DAEMON_SCRIPT = os.path.join(PLUGIN_DIR, "py_modules", "xim_daemon.py")
 POLL_SECONDS = 1.0
+# How soon after the pause is turned off its input servers start: a few polls.
+RESUME_START_SECONDS = 10.0
 MODE_REQUEST_WAIT_SECONDS = 0.3  # the daemon checks for a request every 0.25 s
 # Waiting for the daemon to take a mode asked for: how often to look, and how long.
 MODE_POLL_SECONDS = 0.05
@@ -324,6 +326,13 @@ class Bridge:
         # input server: the bridge leaves it alone, keys and Steam keyboard as they are.
         self.unlinked = False
         self.link_checked = (None, 0.0, False)  # (app id, when, unlinked)
+        # When the launch option was last added to or taken out of each game, in
+        # seconds since boot as /proc gives process start times. A game started
+        # before that has to be started again; one started after it and still
+        # without the option lost it.
+        self.option_changed_at = {}
+        self.server_started_at = {}  # display -> when its input server started, the same way
+        self.resumed_at = None  # when the pause was last turned off, the same way
         self.keep_keyboard_on_enter = True
         self.keyboard_opacity = DEFAULT_KEYBOARD_OPACITY
         self.opacity_off_on_desktop = False
@@ -432,6 +441,7 @@ class Bridge:
                 continue
             self.daemon_retry_at.pop(display, None)
             self.daemon_started[display] = now
+            self.server_started_at[display] = seconds_since_boot()
             self.xim_servers[display] = start(
                 ["/usr/bin/python3", DAEMON_SCRIPT, display], display, ui_display
             )
@@ -470,14 +480,18 @@ class Bridge:
         )
 
     def game_unlinked(self, app_id):
-        """Whether the game runs, and none of its programs has the launch option.
-        With no program found, as for a moment while it starts, it counts as linked."""
+        """Whether the game runs, and none of its programs has the launch option, or
+        it lost the input server, which stopped since it started. With no program
+        found, as for a moment while it starts, it counts as linked. Left alone
+        until it starts again, the game takes the Steam keyboard's own Hangul, as
+        it does with no plugin."""
         checked_app, when, unlinked = self.link_checked
         now = time.monotonic()
         if checked_app == app_id and now - when < LINK_CHECK_SECONDS:
             return unlinked
         programs = [process for process in list_game_processes() if process["app_id"] == app_id]
         unlinked = bool(programs) and not any(process["has_xim_option"] for process in programs)
+        unlinked = unlinked or games_to_restart(programs).get(app_id) in ("server", "resumed")
         self.link_checked = (app_id, now, unlinked)
         return unlinked
 
@@ -557,9 +571,64 @@ def list_game_processes():
                 "name": name,
                 "app_id": variables.get(b"SteamAppId", b"").decode(errors="replace"),
                 "has_xim_option": variables.get(b"XMODIFIERS") == XIM_MODIFIER,
+                "started": process_start(pid),
             }
         )
     return sorted(processes, key=lambda process: process["pid"])
+
+
+def process_start(pid):
+    """When a process started, in seconds since boot, or None if unknown."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat:
+            fields = stat.read().rsplit(b")", 1)[1].split()
+        return int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def seconds_since_boot():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def games_to_restart(processes):
+    """The running games that have to be started again, each with why:
+    "added" or "removed", the launch option changed while it ran, and it still
+    runs as before; "server", it runs with the option but started before the input
+    server now running, which it lost when that one stopped (a plugin update, say)
+    and never connects to again; "resumed", the same after the pause was turned
+    off. Pasting needs no connection: the keys still come, and the text goes by
+    the clipboard."""
+    first, settled, linked = {}, set(), {}
+    for process in processes:
+        app = process["app_id"]
+        started = process.get("started")
+        pasting = bridge.games.get(app, {}).get(PASTE)
+        if process["has_xim_option"] and app in bridge.games and not pasting and started is not None:
+            linked[app] = min(linked.get(app, started), started)
+        if app not in bridge.option_changed_at:
+            continue
+        if process["has_xim_option"] == (app in bridge.games):
+            settled.add(app)
+            continue
+        if started is not None:
+            first[app] = min(first.get(app, started), started)
+    restart = {
+        app: "added" if app in bridge.games else "removed"
+        for app, started in first.items()
+        if app not in settled and started < bridge.option_changed_at[app]
+    }
+    servers = [bridge.server_started_at[d] for d in bridge.xim_servers if d in bridge.server_started_at]
+    if servers:
+        # "resumed" when the servers started because the pause was just turned off,
+        # not for one started again later for some other reason.
+        newest = max(servers)
+        resumed = bridge.resumed_at is not None and 0 <= newest - bridge.resumed_at < RESUME_START_SECONDS
+        why = "resumed" if resumed else "server"
+        for app, started in linked.items():
+            if started < newest:
+                restart.setdefault(app, why)
+    return dict(sorted(restart.items()))
 
 
 def hangul_mode_on():
@@ -620,13 +689,15 @@ def keyboard_mode():
 
 
 def current_state():
+    processes = list_game_processes()
     return {
         "games": bridge.games,
         "active": bridge.in_game and not bridge.unlinked,
         "unlinked_game": bridge.active_game if bridge.in_game and bridge.unlinked else None,
         "xim_running": any(is_running(p) for p in bridge.xim_servers.values()),
         "steam_keyboard_path": steam_keyboard_path(),
-        "processes": list_game_processes(),
+        "processes": processes,
+        "restart_games": games_to_restart(processes),
         "keep_keyboard_on_enter": bridge.keep_keyboard_on_enter,
         "keyboard_opacity": bridge.keyboard_opacity,
         "opacity_off_on_desktop": bridge.opacity_off_on_desktop,
@@ -677,6 +748,12 @@ class Plugin:
         bridge.save()
         return await asyncio.to_thread(current_state)
 
+    async def note_launch_option_added(self, app_id):
+        """The panel put the launch option back for a game: running already, the
+        game has to be started again to get it."""
+        bridge.option_changed_at[str(app_id)] = seconds_since_boot()
+        return await asyncio.to_thread(current_state)
+
     async def set_game_enabled(self, app_id, enabled):
         """Use the bridge in a game, for both the Steam keyboard and the physical
         one, or stop, which forgets the game's other options too."""
@@ -688,6 +765,7 @@ class Plugin:
             bridge.games[app] = game
         else:
             bridge.games.pop(app, None)
+        bridge.option_changed_at[app] = seconds_since_boot()
         bridge.save()
         return await asyncio.to_thread(current_state)
 
@@ -743,6 +821,7 @@ class Plugin:
 
     async def remove_game(self, app_id):
         bridge.games.pop(str(app_id), None)
+        bridge.option_changed_at[str(app_id)] = seconds_since_boot()
         bridge.save()
         return await asyncio.to_thread(current_state)
 
@@ -763,6 +842,15 @@ class Plugin:
         return await asyncio.to_thread(current_state)
 
     async def set_paused(self, paused):
+        """Pausing stops the input servers. A game connected to one keeps using
+        what it set up with it once it is gone, and can crash, or hang as it quits
+        waiting for an answer: no pausing while such a game runs."""
+        if paused and not bridge.paused:
+            running = await asyncio.to_thread(list_game_processes)
+            if any(process["has_xim_option"] for process in running):
+                raise ValueError("a game using the input server is running")
+        if bridge.paused and not paused:
+            bridge.resumed_at = seconds_since_boot()
         bridge.paused = bool(paused)
         bridge.save()
         return await asyncio.to_thread(current_state)

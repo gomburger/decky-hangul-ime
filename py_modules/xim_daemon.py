@@ -163,6 +163,7 @@ class GameOutput:
         self.held = None  # the release of a Backspace being held
         self.holding = False
         self.deferred = []  # (method name, arguments) kept back while holding
+        self.commits = 0  # finished text handed over, counted
 
     def hold(self):
         self.holding = True
@@ -260,6 +261,7 @@ class GameOutput:
             self.server.send_key_back(context, serial, event)
 
     def commit(self, text):
+        self.commits += 1
         if self.holding:
             self.deferred.append(("commit", (text,)))
             return
@@ -377,6 +379,8 @@ class Daemon:
         self.wake_wait_file = path(state_files.WAKE_WAIT_MS)
         self.ime_wake_file = path(state_files.IME_WAKE)
         self.ime_wake = False
+        self.enter_commit_file = path(state_files.ENTER_COMMIT)
+        self.enter_commit = False
         self.wake_wait = ENTER_SETTLE_SECONDS
         self.physical_active = False
         self.virtual_active = False
@@ -500,6 +504,7 @@ class Daemon:
             self.paste_output.gap = read_milliseconds(self.paste_gap_file, DEFAULT_GAP_SECONDS)
         self.wake_wait = read_milliseconds(self.wake_wait_file, ENTER_SETTLE_SECONDS, minimum=0)
         self.ime_wake = read_flag(self.ime_wake_file)
+        self.enter_commit = read_flag(self.enter_commit_file)
 
     def _steam_typing_changed(self):
         if not self.steam_typing:
@@ -686,6 +691,8 @@ class Daemon:
         not lost before the IME is on."""
         if self.output is not self.game_output or not self.paster:
             return
+        if self.release_timer:
+            self.release_timer.cancel()  # a hold already on: this one ends it
         self.game_output.hold()
         # Typed fast, the jamo comes before the field takes keys: the key waits.
         delay = max(0.0, self.last_enter + self.wake_wait - time.monotonic())
@@ -725,6 +732,19 @@ class Daemon:
             self.release_timer = None
         self.game_output.release()
 
+    def _commit_before_enter(self):
+        """Press the wake key between the last syllable and Enter, for a game that
+        takes Enter in the same frame as the IME's text and loses the text. Enter
+        waits until the game has had the key, as the text does when waking."""
+        output = self.game_output
+        if self.output is not output or output.direct or output.holding:
+            return
+        if not self.paster or not self.paster.wake_ready():
+            return
+        output.hold()
+        self.release_timer = self.timers.call_later(WAKE_GIVE_UP_SECONDS, self._end_wake_hold)
+        self._press_wake_key()
+
     def _before_key(self, code, state):
         """Wake the game before the first jamo after Enter in Hangul mode, which
         is typed into a text field opened again."""
@@ -763,10 +783,13 @@ class Daemon:
 
         if pressed:
             self._before_key(code, state)
+            commits = self.game_output.commits
             if self._take_key(keycode, code, state):
                 if code not in self.pressed_in_game:
                     self.used_codes.add(code)
                 return
+            if code in ENTER_CODES and self.enter_commit and self.game_output.commits != commits:
+                self._commit_before_enter()
             if code in ENTER_CODES and self.hangul_mode and self.ime_wake:
                 self.entered = True
             if code in ENTER_CODES:
