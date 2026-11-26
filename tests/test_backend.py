@@ -321,6 +321,73 @@ class BackendTest(unittest.TestCase):
         bridge.server_started_at[":1"] = 200.0  # started again much later, not for the pause
         self.assertEqual(run(plugin.get_state(plugin))["restart_games"], {"3": "server"})
 
+    def test_remote_play_uses_the_host_ime_whatever_the_game(self):
+        plugin, backend, bridge, run = self.backend.Plugin, self.backend, self.backend.bridge, asyncio.run
+        backend.remote_play = lambda: ("1260320", ":0")
+        bridge.start_key_watch = lambda display: None
+        bridge.follow_remote_play()
+        mode = run(plugin.get_keyboard_mode(plugin))
+        self.assertEqual((mode["active"], mode["hangul"], mode["remote"], mode["english_on_close"]), (True, False, True, False))
+        # The globe key sent Right Alt: noted, and its echo is not a second switch.
+        run(plugin.note_host_toggle(plugin))
+        self.assertTrue(run(plugin.set_keyboard_hangul(plugin, True))["hangul"])
+        bridge.host_key_pressed(108)
+        self.assertTrue(bridge.remote_hangul)
+        # Caps Lock sends Right Alt with no change here: noted first, then ignored.
+        bridge.own_toggle_at = -100.0
+        run(plugin.note_host_toggle(plugin))
+        bridge.host_key_pressed(108)
+        self.assertTrue(bridge.remote_hangul)
+        # A physical keyboard's Hangul key switches the host: the layout follows.
+        bridge.own_toggle_at = -100.0
+        bridge.host_key_pressed(130)
+        self.assertFalse(bridge.remote_hangul)
+        bridge.host_key_pressed(30)  # any other key
+        self.assertFalse(bridge.remote_hangul)
+        self.assertEqual(run(plugin.get_state(plugin))["remote_play"], "1260320")
+        # The stream ends: back to the game's own settings.
+        backend.remote_play = lambda: None
+        bridge.follow_remote_play()
+        self.assertNotIn("remote", run(plugin.get_keyboard_mode(plugin)))
+
+    def test_no_focus_watch_while_paused_or_with_no_game(self):
+        bridge = self.backend.bridge
+        stopped = []
+        bridge.follow_remote_play = lambda found=None: None
+        self.backend.scan_steam = lambda: (None, None)
+        bridge.focus_watch = (":0", None, type("Stop", (), {"set": lambda _self: stopped.append(True)})())
+        bridge.games = {}
+        bridge.sync()
+        self.assertEqual((stopped, bridge.focus_watch), ([True], None))
+        self.assertIsNone(bridge.next_sync_delay(0.0))  # no stream: Steam tells of one
+        bridge.remote_app = "1260320"
+        self.assertEqual(bridge.next_sync_delay(0.0), self.backend.IDLE_POLL_SECONDS)
+        bridge.remote_app = None
+        # Steam told of a stream starting: its client may come a moment later.
+        asyncio.run(self.backend.Plugin.notify_change(self.backend.Plugin))
+        self.assertEqual(bridge.next_sync_delay(self.backend.time.monotonic()), self.backend.POLL_SECONDS)
+        self.assertIsNone(bridge.next_sync_delay(self.backend.time.monotonic() + 20))
+        # Paused: nothing looked at, and no look until a wake.
+        self.backend.scan_steam = lambda: self.fail("looked at /proc while paused")
+        bridge.paused, bridge.games = True, {"3": {}}
+        bridge.sync()
+        self.assertIsNone(bridge.next_sync_delay(0.0))
+
+    def test_idle_looks_stop_a_while_after_the_last_game(self):
+        backend, bridge = self.backend, self.backend.bridge
+        bridge.games = {"3": {}}
+        bridge.focus_watch = (":0", type("Thread", (), {"is_alive": lambda _self: True})(), None)
+        backend.display_lost = lambda thread: False
+        bridge.in_game, bridge.busy_at = False, 100.0
+        self.assertEqual(bridge.next_sync_delay(130.0), backend.IDLE_POLL_SECONDS)
+        self.assertIsNone(bridge.next_sync_delay(170.0))  # a minute with no game
+        bridge.remote_app = "1260320"  # a stream still looks now and then
+        self.assertEqual(bridge.next_sync_delay(170.0), backend.IDLE_POLL_SECONDS)
+        bridge.remote_app = None
+        bridge.in_game = True
+        self.assertEqual(bridge.next_sync_delay(170.0), backend.POLL_SECONDS)
+        bridge.focus_watch = None
+
     def test_link_is_looked_at_again_after_a_while(self):
         bridge = self.backend.bridge
         programs = [{"pid": 1, "name": "game.exe", "app_id": "3", "has_xim_option": False}]

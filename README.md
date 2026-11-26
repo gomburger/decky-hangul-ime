@@ -1,16 +1,16 @@
 # Hangul IME Bridge
 
-Steam Deck 게임 모드에서 Proton(Wine) 게임에 한글을 입력하게 해 주는 Decky Loader 플러그인입니다. Steam 가상 키보드와 물리 키보드를 모두 지원합니다.
+SteamOS 게임 모드(Steam Deck 등)에서 Proton(Wine) 게임에 한글을 입력하게 해 주는 Decky Loader 플러그인입니다. Steam 가상 키보드와 물리 키보드를 모두 지원합니다.
 
 ## 필요한 것
 
-- 게임 모드로 실행 중인 Steam Deck
+- SteamOS 게임 모드로 실행 중인 기기 (Steam Deck 등). Steam Deck 외의 기기에서는 시험하지 않았습니다.
 - [Decky Loader](https://decky.xyz/)
 - Proton으로 실행하는 게임 (Steam 게임, 비 Steam 게임 모두 가능)
 
 ## 설치
 
-1. [릴리스 페이지](https://github.com/gomburger/decky-hangul-ime/releases/latest)에서 `decky-hangul-ime-<version>.zip`을 Steam Deck에 내려받습니다.
+1. [릴리스 페이지](https://github.com/gomburger/decky-hangul-ime/releases/latest)에서 `decky-hangul-ime-<version>.zip`을 기기에 내려받습니다.
 2. Decky 설정에서 개발자 모드를 켭니다.
 3. Decky 설정의 **개발자** 메뉴에서 **ZIP으로 플러그인 설치**를 선택하고 내려받은 파일을 고릅니다.
 
@@ -52,6 +52,16 @@ Steam 가상 키보드의 한국어 자판으로 친 글자는 플러그인이 �
 **Enter 전 글자 확정** (기본 꺼짐, 기본 방식에서만): Enter를 누르면 조합 중이던 마지막 글자가 빠지는 게임에서 켭니다.
 
 **Enter 후 IME 깨우기** (기본 꺼짐): 채팅을 보낸 뒤 입력창을 다시 열면 한글이 안 들어가는 게임에서 켭니다. 그래도 안 되면 **Enter 후 입력 대기**를 늘리세요.
+
+## 리모트 플레이
+
+다른 PC의 게임을 리모트 플레이로 할 때는 게임을 등록하지 않아도 자동으로 동작합니다. 한글은 호스트 PC의 IME가 조합하므로, 호스트에서 오른쪽 Alt가 한/영 전환 키로 설정되어 있어야 합니다. Windows 호스트에서 테스트했습니다.
+
+- **지구본 키**와 **가/A** 버튼: 호스트와 자판의 한/영을 함께 바꿉니다.
+- 한국어 자판의 **한/영** 키(Caps Lock 자리, 왼쪽 스틱 클릭): 호스트의 한/영만 바꿉니다. 호스트와 자판 표시가 어긋났을 때 맞추세요.
+- 연결한 물리 키보드의 한/영 키나 오른쪽 Alt를 누르면 자판도 따라 바뀝니다.
+- 호스트의 한/영 상태는 알 수 없어 자판 표시와 어긋날 수 있습니다. 대부분의 게임은 입력 칸이 닫혀 있을 때 IME를 꺼 두기 때문에, 그때 지구본 키를 누르면 자판만 바뀌고 호스트는 그대로인 경우가 가장 흔합니다. 호스트에서 직접 한/영을 바꿨을 때도 어긋납니다.
+- 글자를 빠르게 입력하는 도중에 한/영을 바꾸면 호스트에서 전환이 빠질 수 있습니다.
 
 ## 공통 설정
 

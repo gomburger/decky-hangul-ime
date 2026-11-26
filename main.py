@@ -13,8 +13,10 @@ import os
 import re
 import signal
 import socket
+import select
 import subprocess
 import sys
+import threading
 import time
 
 PLUGIN_DIR = os.environ.get("DECKY_PLUGIN_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -27,13 +29,28 @@ from state_files import (  # noqa: E402
     WAKE_WAIT_MS,
     VIRTUAL, state_path,
 )
+from key_watch import RawKeyWatch, RootPropertyWatch, display_lost, park_on_lost_display  # noqa: E402
 
 SETTINGS_DIR = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR", "/tmp/hangul-ime-bridge")
 LOG_DIR = os.environ.get("DECKY_PLUGIN_LOG_DIR", SETTINGS_DIR)
 USER_HOME = os.environ.get("DECKY_USER_HOME", "/home/deck")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 DAEMON_SCRIPT = os.path.join(PLUGIN_DIR, "py_modules", "xim_daemon.py")
+# How often the processes are matched to the focus and settings, when nothing calls
+# for it sooner: a change of focus, a game or stream starting or ending, or a
+# setting, wakes it at once. While a registered game is in focus it looks every
+# second all the same, for a game started without the launch option or an input
+# server that stopped; and so it does with no watch of the focus to wake it.
 POLL_SECONDS = 1.0
+IDLE_POLL_SECONDS = 10.0
+# With no registered game in focus this long, the idle looks stop too: the focus
+# watch, Steam's notices and the settings wake it, and so does a watch that ends.
+IDLE_STOP_SECONDS = 60.0
+# Steam tells of a game or stream as it starts or ends, before its processes are
+# there or gone (the streaming client starts after the notice): for a while after
+# one, it looks every second.
+NOTICE_FOLLOW_SECONDS = 15.0
+FOCUS_PROPERTIES = ("GAMESCOPE_FOCUSED_APP", "GAMESCOPE_FOCUSED_WINDOW")
 # How soon after the pause is turned off its input servers start: a few polls.
 RESUME_START_SECONDS = 10.0
 MODE_REQUEST_WAIT_SECONDS = 0.3  # the daemon checks for a request every 0.25 s
@@ -43,6 +60,13 @@ MODE_SETTLE_SECONDS = 0.8
 XIM_MODIFIER = b"@im=hangulbridge"
 # How often to look again whether the focused game was started with the launch option.
 LINK_CHECK_SECONDS = 5.0
+# Remote Play: the keys that switch the host PC between Hangul and English, as
+# keycodes on the streaming client's display (Right Alt, Hangul); and how long the
+# Right Alt the plugin sends itself may take to come back there.
+HOST_TOGGLE_KEYCODES = frozenset((108, 130))
+OWN_TOGGLE_SECONDS = 0.6
+# How often a watch's thread wakes with nothing to read, to see whether to stop.
+WATCH_POLL_SECONDS = 0.5
 # An input server stopping sooner than this after its start counts as failing.
 DAEMON_QUICK_STOP_SECONDS = 10.0
 DAEMON_RETRY_MAX_SECONDS = 60
@@ -124,20 +148,8 @@ def clamp_paste_gap(value):
 def steam_in_desktop_mode():
     """Whether Steam runs on the desktop rather than in game mode, where gamescope
     starts it. Unknown counts as game mode."""
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            with open(f"/proc/{pid}/comm", encoding="utf-8") as comm:
-                if comm.read().strip() != "steam":
-                    continue
-            with open(f"/proc/{pid}/environ", "rb") as environ:
-                entries = environ.read().split(b"\0")
-        except OSError:
-            continue
-        for entry in entries:
-            if entry.startswith(b"XDG_CURRENT_DESKTOP="):
-                return entry.split(b"=", 1)[1] != b"gamescope"
-        return False
-    return False
+    pid = bridge.steam_pid or scan_steam()[0]
+    return steam_info(pid)[1]
 
 
 def clamp_keyboard_opacity(value):
@@ -208,20 +220,53 @@ def display_served(display, directory=None):
     return False
 
 
-def steam_display():
-    """Return the display Steam's own UI runs on."""
-    output = run_host(["pgrep", "-x", "steam"])
-    pids = output.split() if output else []
-    if not pids:
-        return None
-    try:
-        with open(f"/proc/{pids[0]}/environ", "rb") as environ:
-            for entry in environ.read().split(b"\0"):
-                if entry.startswith(b"DISPLAY="):
-                    return entry[len(b"DISPLAY="):].decode()
-    except OSError:
-        pass
-    return None
+# /proc/<pid>/comm holds a program's name cut at 15 characters.
+STEAM_COMM = b"steam"
+STREAMING_CLIENT_COMM = b"streaming_clien"
+
+
+def scan_steam():
+    """One look through /proc, by names alone, for Steam and Remote Play's client:
+    Steam's pid (the lowest, as pgrep gives it) and the stream as remote_play
+    tells it, either of them None."""
+    steam_pid, remote = None, None
+    for pid in sorted(int(name) for name in os.listdir("/proc") if name.isdigit()):
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as comm:
+                name = comm.read().strip()
+        except OSError:
+            continue
+        if name == STEAM_COMM and steam_pid is None:
+            steam_pid = pid
+        elif name == STREAMING_CLIENT_COMM and remote is None:
+            remote = streaming_client(pid)
+    return steam_pid, remote
+
+
+steam_info_cache = {}  # Steam's pid -> (its display, whether on the desktop)
+LOOK = object()  # an argument not given: look for it
+
+
+def steam_info(pid):
+    """The display Steam's UI runs on, and whether Steam runs on the desktop, for
+    its pid: read once, as they last as long as the process."""
+    if not pid:
+        return None, False
+    if pid not in steam_info_cache:
+        display, desktop = None, False
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as environ:
+                entries = environ.read().split(b"\0")
+        except OSError:
+            return None, False
+        for entry in entries:
+            if entry.startswith(b"DISPLAY="):
+                display = entry[len(b"DISPLAY="):].decode()
+            elif entry.startswith(b"XDG_CURRENT_DESKTOP="):
+                desktop = entry.split(b"=", 1)[1] != b"gamescope"
+        steam_info_cache.clear()  # one Steam at a time
+        steam_info_cache[pid] = (display, desktop)
+    return steam_info_cache[pid]
 
 
 def read_focus(display):
@@ -332,6 +377,23 @@ class Bridge:
         # without the option lost it.
         self.option_changed_at = {}
         self.server_started_at = {}  # display -> when its input server started, the same way
+        # Remote Play: the app streamed, its display, and the host PC's Hangul mode as
+        # last switched from here. The host's IME cannot be read, so this is a guess.
+        self.remote_app = None
+        self.remote_display = None
+        self.remote_hangul = False
+        self.own_toggle_at = -OWN_TOGGLE_SECONDS  # when the plugin last sent Right Alt
+        self.key_watch = None  # (thread, stop event)
+        self.steam_pid = None  # as the last sync found it
+        # The focus as gamescope last set it, kept by a watch of Steam's display, and
+        # what wakes the sync loop.
+        self.focus = (None, None)
+        self.focus_watch = None  # (display, thread, stop event)
+        self.focus_watch_failed = None  # the display it last could not watch
+        self.notice_until = 0.0  # looking every second until then, after a notice
+        self.busy_at = time.monotonic()  # when a registered game last had focus
+        self.loop = None
+        self.wake_event = None
         self.resumed_at = None  # when the pause was last turned off, the same way
         self.keep_keyboard_on_enter = True
         self.keyboard_opacity = DEFAULT_KEYBOARD_OPACITY
@@ -415,11 +477,20 @@ class Bridge:
 
     def sync(self):
         """Match the running processes to the current focus and settings."""
-        if self.paused or not self.games:
+        if self.paused:
+            # Nothing runs while paused, nor is anything looked at.
+            self.follow_remote_play(None)
             self.stop_everything()
+            self.stop_focus_watch()
+            return
+        self.steam_pid, remote = scan_steam()
+        self.follow_remote_play(remote)
+        if not self.games:
+            self.stop_everything()
+            self.stop_focus_watch()  # no game to follow; started again when one is
             return
 
-        ui_display = steam_display()
+        ui_display = steam_info(self.steam_pid)[0]
         if not ui_display:
             return
 
@@ -446,7 +517,7 @@ class Bridge:
                 ["/usr/bin/python3", DAEMON_SCRIPT, display], display, ui_display
             )
 
-        focused, window = read_focus(ui_display)
+        focused, window = self.current_focus(ui_display)
         if focused in self.games:
             self.game_window = window
             self.active_game = focused
@@ -456,6 +527,10 @@ class Bridge:
         self.in_game = focused in self.games or (
             window is not None and window == self.game_window
         )
+        if self.remote_app is not None:
+            self.in_game = False  # the app runs on the host PC, not here
+        if self.in_game:
+            self.busy_at = time.monotonic()
         self.unlinked = self.in_game and self.game_unlinked(self.active_game)
         game = self.games.get(self.active_game, {}) if self.in_game and not self.unlinked else {}
         for display in game_displays:
@@ -504,6 +579,118 @@ class Bridge:
             state.write(active if isinstance(active, str) else str(int(active)))
         self.input_state[(display, input_type)] = active
 
+    def follow_remote_play(self, found=LOOK):
+        """Start or stop watching the keys of a Remote Play stream, found as
+        remote_play tells it, or looked for here. A new stream starts in English, as
+        the host's apps mostly do."""
+        if found is LOOK:
+            found = remote_play()
+        if self.paused:
+            found = None
+        app, display = found if found else (None, None)
+        if (app, display) == (self.remote_app, self.remote_display):
+            return
+        self.stop_key_watch()
+        self.remote_app, self.remote_display = app, display
+        self.remote_hangul = False
+        if display:
+            self.start_key_watch(display)
+
+    def start_key_watch(self, display):
+        try:
+            watch = RawKeyWatch(display)
+        except OSError as error:
+            log.warning("cannot watch the keys on %s: %s", display, error)
+            return
+
+        def keys():
+            for keycode in watch.presses():
+                self.host_key_pressed(keycode)
+
+        self.key_watch = run_watch("key-watch", watch, keys, on_end=self.wake)
+
+    def wake(self):
+        """Have the sync loop look now, from any thread."""
+        if self.loop and self.wake_event:
+            self.loop.call_soon_threadsafe(self.wake_event.set)
+
+    def next_sync_delay(self, now):
+        """Seconds until the sync loop looks again unwoken, or None to wait for a
+        wake: paused, only turning the pause off (a setting) matters."""
+        if self.paused:
+            return None
+        if now < self.notice_until:
+            return POLL_SECONDS
+        # With no game registered, only a stream or a setting matters, and both wake
+        # the loop: Steam tells of a stream as it starts and ends (measured). While
+        # one runs, an idle look all the same, for an end it did not tell of.
+        if not self.games:
+            return IDLE_POLL_SECONDS if self.remote_app is not None else None
+        if self.in_game or not self.focus_watched():
+            delay = POLL_SECONDS
+        elif self.remote_app is None and not self.daemon_retry_at and now - self.busy_at >= IDLE_STOP_SECONDS:
+            return None
+        else:
+            delay = IDLE_POLL_SECONDS
+        for retry_at in self.daemon_retry_at.values():
+            delay = min(delay, max(0.0, retry_at - now))
+        return delay
+
+    def focus_watched(self):
+        return bool(self.focus_watch) and self.focus_watch[1].is_alive() and not display_lost(self.focus_watch[1])
+
+    def current_focus(self, ui_display):
+        """gamescope's focused (app id, window id): as the watch last saw them, or
+        read now with xprop where no watch runs, starting one for next time."""
+        if self.focus_watched() and self.focus_watch[0] == ui_display:
+            return self.focus
+        self.start_focus_watch(ui_display)
+        return read_focus(ui_display)
+
+    def start_focus_watch(self, display):
+        self.stop_focus_watch()
+        try:
+            watch = RootPropertyWatch(display, FOCUS_PROPERTIES)
+        except OSError as error:
+            if self.focus_watch_failed != display:  # said once, then looked for quietly
+                log.warning("cannot watch the focus on %s: %s", display, error)
+            self.focus_watch_failed = display
+            return
+        self.focus_watch_failed = None
+
+        def note():
+            app, window = (watch.values().get(name) for name in FOCUS_PROPERTIES)
+            focus = (str(app) if app else None, str(window) if window else None)
+            if focus != self.focus:
+                self.focus = focus
+                self.wake()
+
+        def changes():
+            if watch.changed():
+                note()
+
+        self.focus_watch = (display, *run_watch("focus-watch", watch, changes, first=note, on_end=self.wake))
+
+    def stop_focus_watch(self):
+        if self.focus_watch:
+            self.focus_watch[2].set()
+            self.focus_watch = None
+
+    def stop_key_watch(self):
+        if self.key_watch:
+            self.key_watch[1].set()
+            self.key_watch = None
+
+    def host_key_pressed(self, keycode):
+        """A key that switches the host between Hangul and English, pressed on a
+        physical keyboard: the Steam keyboard's layout follows. Right Alt the plugin
+        sent itself comes back here too, and is not a second switch."""
+        if keycode not in HOST_TOGGLE_KEYCODES:
+            return
+        if time.monotonic() - self.own_toggle_at < OWN_TOGGLE_SECONDS:
+            return
+        self.remote_hangul = not self.remote_hangul
+
     def stop_everything(self):
         self.game_window = None
         self.active_game = None
@@ -518,13 +705,46 @@ bridge = Bridge()
 sync_task = None
 
 
+def run_watch(name, watch, step, first=None, on_end=None):
+    """Run a watch of a display on a thread of its own: first once, then step
+    whenever its connection has something, until the stop event returned with the
+    thread is set. The thread is parked, not the process ended, if the display goes.
+    on_end is called as it ends by itself, or is parked: the sync loop may be waiting
+    on it."""
+    stop = threading.Event()
+
+    def run():
+        try:
+            if first:
+                first()
+            while not stop.is_set():
+                select.select([watch.fileno()], [], [], WATCH_POLL_SECONDS)
+                step()
+        except Exception:
+            log.exception("%s failed", name)
+        finally:
+            watch.close()
+            if on_end and not stop.is_set():
+                on_end()
+
+    thread = park_on_lost_display(threading.Thread(target=run, name=name, daemon=True), on_end)
+    thread.start()
+    return thread, stop
+
+
 async def sync_loop():
+    bridge.loop = asyncio.get_running_loop()
+    bridge.wake_event = asyncio.Event()
     while True:
+        bridge.wake_event.clear()  # a wake while syncing calls for another look
         try:
             await asyncio.to_thread(bridge.sync)
         except Exception:
             log.exception("sync failed")
-        await asyncio.sleep(POLL_SECONDS)
+        try:
+            await asyncio.wait_for(bridge.wake_event.wait(), bridge.next_sync_delay(time.monotonic()))
+        except asyncio.TimeoutError:
+            pass
 
 
 def is_wine_binary(path):
@@ -631,8 +851,33 @@ def games_to_restart(processes):
     return dict(sorted(restart.items()))
 
 
+def streaming_client(pid):
+    """The app a Remote Play client streams and the display it shows on, or None."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
+            arguments = cmdline.read().split(b"\0")
+        if os.path.basename(arguments[0]) != b"streaming_client":
+            return None
+        with open(f"/proc/{pid}/environ", "rb") as environ:
+            entries = environ.read().split(b"\0")
+    except OSError:
+        return None
+    variables = dict(entry.split(b"=", 1) for entry in entries if b"=" in entry)
+    app = arguments[arguments.index(b"--appid") + 1] if b"--appid" in arguments[:-1] else b""
+    return app.decode(errors="replace"), variables.get(b"DISPLAY", b":0").decode(errors="replace")
+
+
+def remote_play():
+    """The app streamed by Remote Play and the display its client shows on, or None.
+    The streaming client runs here; the game runs on the host PC."""
+    return scan_steam()[1]
+
+
 def hangul_mode_on():
-    """Tell whether any display's daemon is in Hangul mode for physical keyboards."""
+    """Tell whether any display's daemon is in Hangul mode for physical keyboards,
+    or in Remote Play, whether the host PC was last switched to Hangul."""
+    if bridge.remote_app is not None:
+        return bridge.remote_hangul
     for display in bridge.xim_servers:
         name = input_state_path(display, MODE)
         try:
@@ -678,6 +923,10 @@ def steam_keyboard_path():
 def keyboard_mode():
     """Whether the game in focus uses the bridge, which then composes Hangul from the
     letters the Steam keyboard types, and whether Hangul mode is on."""
+    if bridge.remote_app is not None:
+        # The host PC composes: the Korean layout types letters, and the globe key
+        # sends Right Alt. Whatever game is streamed, registered or not.
+        return {"active": True, "hangul": bridge.remote_hangul, "english_on_close": False, "batch": False, "remote": True}
     linked = bridge.in_game and not bridge.unlinked and not bridge.paused
     game = bridge.games.get(bridge.active_game, {}) if linked else {}
     return {
@@ -698,6 +947,7 @@ def current_state():
         "steam_keyboard_path": steam_keyboard_path(),
         "processes": processes,
         "restart_games": games_to_restart(processes),
+        "remote_play": bridge.remote_app,
         "keep_keyboard_on_enter": bridge.keep_keyboard_on_enter,
         "keyboard_opacity": bridge.keyboard_opacity,
         "opacity_off_on_desktop": bridge.opacity_off_on_desktop,
@@ -728,6 +978,8 @@ class Plugin:
     async def _unload(self):
         if sync_task:
             sync_task.cancel()
+        bridge.stop_key_watch()
+        bridge.stop_focus_watch()
         await asyncio.to_thread(bridge.stop_everything)
 
     async def get_state(self):
@@ -870,7 +1122,19 @@ class Plugin:
         bridge.save()
         return await asyncio.to_thread(current_state)
 
+    async def notify_change(self):
+        """Steam says a game or a Remote Play stream started or ended."""
+        bridge.notice_until = time.monotonic() + NOTICE_FOLLOW_SECONDS
+
+    async def note_host_toggle(self):
+        """The Steam keyboard is about to send Right Alt to the host: the key watch
+        will see it come back, and must not take it for a switch of its own."""
+        bridge.own_toggle_at = time.monotonic()
+
     async def set_hangul_mode(self, enabled):
+        if bridge.remote_app is not None:
+            bridge.remote_hangul = bool(enabled)  # the host is switched by the panel
+            return await asyncio.to_thread(current_state)
         request_hangul_mode(bool(enabled))
         await asyncio.sleep(MODE_REQUEST_WAIT_SECONDS)
         return await asyncio.to_thread(current_state)
@@ -891,6 +1155,9 @@ class Plugin:
         had time to take it, so the Steam keyboard sends letters only once they are
         composed."""
         wanted = bool(enabled)
+        if bridge.remote_app is not None:
+            bridge.remote_hangul = wanted
+            return keyboard_mode()
         request_hangul_mode(wanted)
         waited = 0.0
         while waited < MODE_SETTLE_SECONDS:
@@ -900,3 +1167,26 @@ class Plugin:
                 break
         return await asyncio.to_thread(keyboard_mode)
 
+
+# Calls that change what the input servers or the Steam keyboard are to do: the
+# sync loop looks at once after each, rather than at its next idle look.
+WAKING_METHODS = (
+    "set_account", "claim_games", "note_launch_option_added", "set_game_enabled", "set_game_input",
+    "set_send_method", "set_toggle_key", "set_wake_wait_ms", "set_paste_gap_ms", "remove_game",
+    "set_game_setting", "set_paused", "set_backspace_hold_ms", "set_batch_row_missing", "notify_change",
+)
+
+
+def _waking(method):
+    async def call(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            bridge.wake()
+
+    call.__name__, call.__doc__ = method.__name__, method.__doc__
+    return call
+
+
+for _name in WAKING_METHODS:
+    setattr(Plugin, _name, _waking(getattr(Plugin, _name)))

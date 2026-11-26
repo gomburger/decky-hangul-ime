@@ -30,6 +30,8 @@ const setPasteGap = callable("set_paste_gap_ms");
 const setHangulMode = callable("set_hangul_mode");
 const getKeyboardMode = callable("get_keyboard_mode");
 const setKeyboardHangul = callable("set_keyboard_hangul");
+const noteHostToggle = callable("note_host_toggle");
+const notifyChange = callable("notify_change");
 const setAccount = callable("set_account");
 const claimGames = callable("claim_games");
 const getBatchText = callable("get_batch_text");
@@ -176,6 +178,27 @@ const RESTART_REASONS = {
     server: "입력 서버를 다시 시작했어요.",
     resumed: "일시 중지를 해제했어요.",
 };
+
+// Remote Play: the game runs on the host PC, which composes Hangul itself; here
+// only the Steam keyboard changes, the same for every game streamed.
+function RemotePlayRows({ hangulMode, onModeButton }) {
+    return [
+        h(DFL.PanelSectionRow, { key: "remoteStatus" },
+            h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: "#8b929a" } },
+                "리모트 플레이 중이에요.")),
+        h(DFL.PanelSectionRow, { key: "remoteMode" }, TopRow(
+            h(DFL.Field, {
+                label: h("div", { style: { height: "36px", whiteSpace: "nowrap", fontSize: "12px", lineHeight: NOTE_LINE_HEIGHT, color: "#8b929a" } },
+                    h("div", null, "호스트 PC가 한글을 조합해요."),
+                    h("div", null, "전환 키는 오른쪽 Alt로 보내요.")),
+                ...VALUE_COLUMN,
+            },
+                columnValue(h(DFL.DialogButton, {
+                    onClick: onModeButton,
+                    style: { minWidth: "56px", width: "56px", height: "36px", padding: 0, fontSize: "20px" },
+                }, hangulMode ? "가" : "A"))))),
+    ];
+}
 
 function statusText(state, isEnabled, app) {
     if (!app) return "게임을 실행하면 여기서 켤 수 있어요.";
@@ -959,9 +982,13 @@ function App() {
 
     const hangulMode = Boolean(state?.hangul_mode);
 
+    const remotePlay = state?.remote_play != null;
     const onModeButton = async () => {
         setState({ ...state, hangul_mode: !hangulMode });
         try {
+            // In Remote Play the host gets no keys while this panel is open: its
+            // Right Alt goes once the panel closes.
+            if (remotePlay) toggleHostWhenPanelCloses(panelTop?.ownerDocument);
             setState(await setHangulMode(!hangulMode));
         }
         catch (error) {
@@ -1066,7 +1093,8 @@ function App() {
 
     return h("div", { ref: (element) => { panelTop = element; } },
         h(DFL.PanelSection, { title: app?.display_name || "한글 입력" },
-            needsRestart
+            remotePlay ? RemotePlayRows({ hangulMode, onModeButton }) : null,
+            remotePlay ? null : needsRestart
                 ? h(DFL.PanelSectionRow, null,
                     h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: STATUS_WARN_COLOR } },
                         h("div", null, RESTART_REASONS[restartReason] ?? RESTART_REASONS.server),
@@ -1079,11 +1107,11 @@ function App() {
                 : h(DFL.PanelSectionRow, null,
                     h("div", { style: { whiteSpace: "nowrap", fontSize: "12px", color: "#8b929a" } },
                         statusText(state, isEnabled, app))),
-            unlinked && h(DFL.PanelSectionRow, null,
+            !remotePlay && unlinked && h(DFL.PanelSectionRow, null,
                 h("div", { [TOP_ROW_ATTR]: "" },
                     h(DFL.ButtonItem, { layout: "below", onClick: onRestoreLaunchOption }, "실행 옵션 복구"))),
             message && h(DFL.PanelSectionRow, null, h("div", { style: { fontSize: "12px" } }, message)),
-            h(DFL.PanelSectionRow, null, TopRow(
+            !remotePlay && h(DFL.PanelSectionRow, null, TopRow(
                 h(DFL.Field, {
                     label: h("span", { style: { whiteSpace: "nowrap" } }, "이 게임에서 사용"),
                     bottomSeparator: isEnabled ? "none" : "standard",
@@ -1095,12 +1123,12 @@ function App() {
                             disabled: !app,
                             onChange: onUseToggle,
                         })))))),
-            isEnabled && h(ToggleRow, {
+            !remotePlay && isEnabled && h(ToggleRow, {
                 label: labelWithNote("키보드 닫으면 영문으로", "조작키가 한글로 바뀌지 않게 해요.", "다시 열면 이전 한/영 상태로 돌아가요."),
                 value: game?.english_on_close ?? true,
                 onChange: onEnglishOnCloseChange,
             }),
-            isEnabled && h(DFL.PanelSectionRow, null,
+            !remotePlay && isEnabled && h(DFL.PanelSectionRow, null,
                 h("div", { style: { marginTop: "-8px" } },
                     h(DFL.Field, {
                         // As tall as the button beside it, so the text sits at the top.
@@ -1113,7 +1141,7 @@ function App() {
                             onClick: onModeButton,
                             style: { minWidth: "56px", width: "56px", height: "36px", padding: 0, fontSize: "20px" },
                         }, hangulMode ? "가" : "A"))))),
-            isEnabled && h(SendMethodRows, { state, game, isEnabled, ...{
+            !remotePlay && isEnabled && h(SendMethodRows, { state, game, isEnabled, ...{
                     onMethodChange,
                     onHoldChange: onBackspaceHoldChange,
                     onEraseTextChange: onOptionToggle("erase_text"),
@@ -1406,7 +1434,7 @@ function typeLetter(keyboard, letter, key) {
     const toggles = keyboard.state?.toggleStates ?? {};
     const shift = Boolean(key.strShifted) || toggleOn(toggles.Shift);
     // Switching to Hangul, the daemon may not compose yet: the letter waits.
-    if (hangulTarget === true && !keyboardMode.hangul) heldLetters.push({ keyboard, letter, shift });
+    if (hangulTarget === true && !keyboardMode.hangul && !keyboardMode.remote) heldLetters.push({ keyboard, letter, shift });
     else sendLetter(keyboard, letter, shift);
     keyboard.setState((state) => ({
         ...state,
@@ -1423,7 +1451,8 @@ function typeLetter(keyboard, letter, key) {
 // From the globe key until the daemon has left Hangul mode, it would compose what is
 // typed, so keys wait, whatever the keyboard already shows.
 function goingToEnglish(keyboard) {
-    if (!keyboardMode.active || !typingIntoGame(keyboard)) return false;
+    // In Remote Play the host composes: nothing here has to wait for a mode.
+    if (!keyboardMode.active || keyboardMode.remote || !typingIntoGame(keyboard)) return false;
     return keyboardState(keyboard).toEnglish === true || (hangulTarget === false && keyboardMode.hangul);
 }
 
@@ -1453,7 +1482,17 @@ function patchKeyboardClass(keyboard) {
             heldKeys.push({ keyboard: this, own, key });
             return undefined;
         }
-        if (hangulShowing(this)) {
+        if (key?.strKey === CAPS_LOCK_KEY && hostToggleShowing(this)) {
+            // Remote Play: Caps Lock, of no use for Hangul, switches the host
+            // alone, to bring it back in step with the layout shown here. A touch
+            // has sent it already, as it came down.
+            if (!capsTouched) pressCapsOnce();
+            return undefined;
+        }
+        // In Remote Play by the layout alone: a jamo key pressed while the mode is
+        // still switching would otherwise go as Steam's own Hangul, which the host
+        // gets as a digit.
+        if (hangulShowing(this) || hostToggleShowing(this)) {
             if (key?.strKey === CAPS_LOCK_KEY) return undefined;
             const letter = showsKorean(this) ? KEYCODE_LETTERS[Number(key?.strKeycode)] : null;
             if (letter) {
@@ -1485,11 +1524,24 @@ function patchKeyboardClass(keyboard) {
     }
     // Caps Lock comes on by touch, held, and by a stick click too: while Hangul
     // shows, every change keeps it off.
+    // The left stick's click turns Caps Lock on here, not through TypeKeyInternal: in
+    // Remote Play that is the host's switch too.
     prototype.setState = function (update, callback) {
-        if (!hangulShowing(this)) return own.setState.call(this, update, callback);
+        const remoteKorean = hostToggleShowing(this);
+        if (!remoteKorean && !hangulShowing(this)) return own.setState.call(this, update, callback);
+        const keyboard = this;
+        const noteCaps = (before, after) => {
+            if (!remoteKorean) return;
+            noteCapsTurnedOn(keyboard, before, after);
+            noteCapsTouch(before, after);
+        };
         const next = typeof update === "function"
-            ? (state, props) => withoutCapsLock(update(state, props))
-            : withoutCapsLock(update);
+            ? (state, props) => {
+                const result = update(state, props);
+                noteCaps(state, result);
+                return withoutCapsLock(result);
+            }
+            : (noteCaps(keyboard.state, update), withoutCapsLock(update));
         return own.setState.call(this, next, callback);
     };
 }
@@ -1545,10 +1597,201 @@ function switchLayout(keyboard, toKorean) {
     step();
 }
 
+// In Remote Play the globe key also switches the host PC, by its Right Alt, sent
+// at once, so the keys typed after it reach the host in the new mode.
 function pressGlobe(keyboard, own) {
     const state = keyboardState(keyboard);
+    if (keyboardMode.remote) sendHostToggle();
     if (hasManyLayouts(keyboard, own) && !state.noKorean) switchLayout(keyboard, !showsKorean(keyboard));
     else switchHangulMode();
+}
+
+// Remote Play: the host PC composes Hangul in its own IME, which Right Alt switches
+// (Steam has no Hangul key to send). Its state cannot be read from here. While
+// keys are typed fast the switch can be lost on the way: the stream carries this
+// keyboard's keys apart from Right Alt, and one landing on the other makes it a
+// modifier (measured; no wait here could keep them apart). The key watch sees this
+// Right Alt come back as if from a physical keyboard, so it is told first.
+const HOST_TOGGLE_KEY = 104;  // Right Alt, in Steam's keyboard key list
+const HOST_TOGGLE_HOLD_MS = 50;
+
+async function sendHostToggle() {
+    try {
+        await noteHostToggle();
+    }
+    catch {
+        /* sent all the same */
+    }
+    try {
+        SteamClient.Input.ControllerKeyboardSetKeyState(HOST_TOGGLE_KEY, true);
+        setTimeout(() => SteamClient.Input.ControllerKeyboardSetKeyState(HOST_TOGGLE_KEY, false), HOST_TOGGLE_HOLD_MS);
+    }
+    catch {
+        /* Steam changed: the layout switches all the same */
+    }
+}
+
+// The 가/A button in Remote Play: the panel is open over the stream, which then
+// gets no keys. Pressed twice, nothing is owed.
+const PANEL_CLOSED_WAIT_MS = 300;
+let hostToggleOwed = false;
+const owedWatched = new WeakSet();
+
+function toggleHostWhenPanelCloses(page) {
+    hostToggleOwed = !hostToggleOwed;
+    if (!page || owedWatched.has(page)) return;
+    owedWatched.add(page);
+    page.addEventListener("visibilitychange", () => {
+        if (page.visibilityState !== "hidden" || !hostToggleOwed) return;
+        hostToggleOwed = false;
+        // Not if the stream ended meanwhile: Right Alt would go to Steam itself.
+        setTimeout(() => {
+            if (keyboardMode.remote) sendHostToggle();
+        }, PANEL_CLOSED_WAIT_MS);
+    });
+}
+
+// Caps Lock shows what it does in Remote Play while Hangul shows. Steam draws the
+// label; only its text is changed, and put back afterwards.
+const HOST_TOGGLE_LABEL = "한/영";
+const relabeledKeys = new Map();  // text node -> its own text
+
+function capsLabel(root) {
+    const key = root?.querySelector(`[data-key="${CAPS_LOCK_KEY}"]`);
+    if (!key) return null;
+    const walker = key.ownerDocument.createTreeWalker(key, 4);  // text nodes
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.nodeValue.trim()) return node;
+    }
+    return null;
+}
+
+// The Korean layout shows in Remote Play, on the standard keys: by the layout, not
+// the mode, so the label changes in the same frame as the layout.
+function hostToggleShowing(keyboard) {
+    return Boolean(keyboardMode.remote) && keyboard.state?.layoutState === 0 && showsKorean(keyboard)
+        && typingIntoGame(keyboard);
+}
+
+// Caps Lock in Remote Play's Korean layout comes three ways: typed (a controller's
+// press, a touch alone), held with another key touched, and by the stick's click.
+// One switch per press, as React may run an update more than once and a touch can
+// come both as held and as typed.
+const CAPS_PRESS_MS = 300;
+let capsPressedAt = 0;
+
+function pressCapsOnce() {
+    if (Date.now() - capsPressedAt < CAPS_PRESS_MS) return;
+    capsPressedAt = Date.now();
+    setTimeout(sendHostToggle, 0);
+}
+
+// The stick's click turns Caps Lock on as it is let go, outside TypeKeyInternal. The
+// host is switched as it goes down already (watchStickClick); this is for when that
+// was not seen.
+let stickSwitched = false;
+
+function noteCapsTurnedOn(keyboard, before, after) {
+    const was = before?.toggleStates?.CapsLock ?? 0;
+    const now = after?.toggleStates?.CapsLock ?? 0;
+    if ((was & 3) !== 0 || (now & 3) === 0) return;
+    // Not a change of layout, which may carry toggle states of its own along.
+    if ("standardLayout" in after && after.standardLayout !== before?.standardLayout) return;
+    if ("layoutState" in after && after.layoutState !== before?.layoutState) return;
+    // The stick let go: whatever came between, the key is no longer down.
+    setTimeout(() => showKeyHeld(keyboard, CAPS_LOCK_KEY, false), 0);
+    if (stickSwitched) stickSwitched = false;
+    else pressCapsOnce();
+}
+
+// A touch on Caps Lock while another key is touched makes it a held modifier to
+// Steam, which then never types it: it is taken here as it comes down instead.
+// Only an update of the touches says whether it is still held, each with a new count
+// of touches per key; other updates carry the state already stripped of it.
+let capsTouched = false;
+
+function noteCapsTouch(before, after) {
+    const caps = after?.toggleStates?.CapsLock;
+    if (caps === undefined || !after.rgLayoutTouchCount || after.rgLayoutTouchCount === before?.rgLayoutTouchCount) return;
+    const held = (caps & 4) !== 0;
+    if (held && !capsTouched) pressCapsOnce();
+    capsTouched = held;
+}
+
+// The stick's click presses no key Steam draws as pressed: drawn here as a touch is,
+// for as long as the stick is held down.
+const LSTICK_CLICK_BUTTON = 15;
+
+function showKeyHeld(keyboard, name, held) {
+    if (!held) {
+        // Let go: whatever a touch meanwhile left there, the key is no longer down.
+        const down = keyboard.state?.keyDown?.key;
+        if (down === name || down == null) keyboard.setState({ keyDown: { key: null, keyRow: -1, keyCol: -1 } });
+        return;
+    }
+    const key = keyboard.m_keyboardDiv?.querySelector(`[data-key="${name}"]`);
+    if (!key) return;
+    const keyRow = parseFloat(key.getAttribute("data-key-row"));
+    const keyCol = parseFloat(key.getAttribute("data-key-col"));
+    keyboard.setState({ keyDown: { key: name, keyRow, keyCol } });
+}
+
+// Watched on the whole page: a touch meanwhile can move the controller's focus, and
+// the release then goes to an element outside the keyboard.
+const stickWatched = new WeakSet();
+let stickHeld = false;
+
+function watchStickClick(root) {
+    const page = root.ownerDocument;
+    if (!page || stickWatched.has(page)) return;
+    stickWatched.add(page);
+    // Returns whether a keyboard here shows Remote Play's Korean layout.
+    const show = (held) => {
+        let shown = false;
+        for (const keyboard of keyboards) {
+            if (keyboard.m_keyboardDiv?.ownerDocument !== page) continue;
+            if (held && !hostToggleShowing(keyboard)) continue;
+            showKeyHeld(keyboard, CAPS_LOCK_KEY, held);
+            shown = true;
+        }
+        return shown;
+    };
+    // The host switches as the stick goes down, as a key would.
+    const follow = (held) => (event) => {
+        if (event.detail?.button !== LSTICK_CLICK_BUTTON) return;
+        if (held && event.detail?.is_repeat) return;
+        stickHeld = held;
+        if (show(held) && held) {
+            stickSwitched = true;
+            pressCapsOnce();
+        }
+    };
+    page.addEventListener("vgp_onbuttondown", follow(true), true);
+    page.addEventListener("vgp_onbuttonup", follow(false), true);
+    // Once a touch comes in, the stick's release no longer reaches this page: the
+    // touch ends the look of it held.
+    page.addEventListener("touchstart", () => {
+        if (!stickHeld) return;
+        stickHeld = false;
+        show(false);
+    }, true);
+}
+
+function showHostToggleKey(keyboard) {
+    if (!hostToggleShowing(keyboard)) return false;
+    const label = capsLabel(keyboard.m_keyboardDiv);
+    if (label && label.nodeValue !== HOST_TOGGLE_LABEL) {
+        if (!relabeledKeys.has(label)) relabeledKeys.set(label, label.nodeValue);
+        label.nodeValue = HOST_TOGGLE_LABEL;
+    }
+    return true;
+}
+
+function restoreHostToggleKeys() {
+    for (const [label, text] of relabeledKeys) {
+        if (label.isConnected && label.nodeValue === HOST_TOGGLE_LABEL) label.nodeValue = text;
+    }
+    relabeledKeys.clear();
 }
 
 function findKeyboards() {
@@ -1597,9 +1840,11 @@ function watchKeyboard(keyboard) {
     const Observer = root.ownerDocument.defaultView.MutationObserver;
     const observer = new Observer(() => {
         if (hangulShowing(keyboard)) showHangul(keyboard);
+        if (!showHostToggleKey(keyboard)) restoreHostToggleKeys();
     });
     observer.observe(root, { childList: true, subtree: true, characterData: true });
     keyboardObservers.set(root, observer);
+    watchStickClick(root);
 }
 
 function unwatchKeyboards() {
@@ -1662,6 +1907,7 @@ function keyboardOpened(keyboard) {
 
 function updateKeyboards() {
     let showing = false;
+    let relabeled = false;
     let openForGame = null;
     for (const keyboard of keyboards) {
         watchKeyboard(keyboard);
@@ -1683,8 +1929,10 @@ function updateKeyboards() {
             turnOffCapsLock(keyboard);
             showHangul(keyboard);
         }
+        if (showHostToggleKey(keyboard)) relabeled = true;
     }
     if (!showing) hideHangul();
+    if (!relabeled) restoreHostToggleKeys();
     if (keyboardOpenForGame && !openForGame) {
         keyboardOpenForGame = false;
         keyboardClosed();
@@ -1835,13 +2083,46 @@ function followKeyboardMode() {
 function restoreKeyboardLook() {
     unwatchKeyboards();
     hideHangul();
+    restoreHostToggleKeys();
     unpatchKeyboardClasses();
     for (const keyboard of keyboards) keyboard.forceUpdate?.();
     keyboards.clear();
 }
 
+// Steam tells when a game or a Remote Play stream starts or ends: the backend looks
+// at once, rather than at its next idle look.
+function followSteamEvents() {
+    const wake = () => notifyChange().catch(() => {});
+    const registrations = [];
+    const register = (source, name) => {
+        try {
+            const registration = source?.[name]?.(wake);
+            if (registration?.unregister) registrations.push(registration);
+        }
+        catch {
+            /* not in this Steam: the backend's own looks still find it */
+        }
+    };
+    register(SteamClient.GameSessions, "RegisterForAppLifetimeNotifications");
+    register(SteamClient.Streaming, "RegisterForStreamingClientStarted");
+    register(SteamClient.Streaming, "RegisterForStreamingClientFinished");
+    return () => {
+        for (const registration of registrations) {
+            try {
+                registration.unregister();
+            }
+            catch {
+                /* gone already */
+            }
+        }
+    };
+}
+
 var index = DFL.definePlugin(() => {
     loadConvenienceSettings();
+    const stopSteamEvents = followSteamEvents();
+    // Loaded again, as after Steam restarts: the backend may be waiting for a wake.
+    notifyChange().catch(() => {});
     patchKeyboards();
     const timer = setInterval(patchKeyboards, 3000);
     const keyboardTimer = setInterval(followKeyboardMode, KEYBOARD_MODE_POLL_MS);
@@ -1856,6 +2137,7 @@ var index = DFL.definePlugin(() => {
         content: h(App, null),
         icon: h("span", { style: { fontWeight: "bold" } }, "한"),
         onDismount() {
+            stopSteamEvents();
             removePickerStyle();
             clearTimeout(convenienceTimer);
             clearInterval(timer);
